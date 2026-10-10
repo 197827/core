@@ -3,7 +3,7 @@
 # bump them deliberately (e.g. via Dependabot's docker ecosystem).
 
 # Builder stage: compile the txwatch binary
-FROM rust:1.98.1-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS builder
+FROM rust:1.99.0-alpine3.24@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS builder
 WORKDIR /build
 # reqwest's default TLS is rustls with the aws-lc-rs crypto provider (no
 # OpenSSL); its C sources need a C toolchain and cmake to build against musl.
