@@ -99,7 +99,7 @@ jobs:
     name: Feature powerset (cargo-hack)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -117,7 +117,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.88
+        uses: dtolnay/rust-toolchain@1.120
 
       - name: Check workspace builds on the MSRV
         run: cargo check --workspace --all-targets --locked
@@ -209,7 +209,7 @@ jobs:
         run: cargo build --release -p txwatch
 
       - name: Upload txwatch binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: txwatch-linux-x86_64
           path: target/release/txwatch
