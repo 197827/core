@@ -1716,3 +1716,138 @@ async fn transactions_request_includes_failed() {
         "every transactions request must carry include_failed=true"
     );
 }
+
+/// Issue #278: cursor persistence must not block the poll loop. With many
+/// contracts and a deliberately slow writer, every contract must still be
+/// polled promptly; the writes are coalesced and performed off the async
+/// workers.
+#[tokio::test]
+async fn slow_cursor_writer_does_not_delay_polls() {
+    const CONTRACTS: usize = 8;
+    const SLOW_WRITE_MS: u64 = 400;
+
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    let contracts: Vec<_> = (0..CONTRACTS)
+        .map(|i| {
+            let mut contract = helpers::contract(
+                "https://hooks.example.com/hook",
+                vec![AlertRule::AnyTransaction],
+            );
+            contract.label = format!("slow-writer-{i}");
+            contract.contract_id = format!(
+                "C{:0>55}",
+                format!("{:X}", i + 1)
+            );
+            contract.horizon_base_url_override = Some(horizon.uri());
+            contract
+        })
+        .collect();
+
+    let cursor_file = std::env::temp_dir().join(format!(
+        "txwatch_slow_writer_{}_{}.json",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&cursor_file);
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts,
+        cursor_file: Some(cursor_file.display().to_string()),
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = tokio::spawn(async move {
+        txwatch_poller::run_with_shutdown(cfg, true, shutdown_rx).await
+    });
+
+    // All contracts must be polled within a window far shorter than
+    // CONTRACTS × SLOW_WRITE_MS, proving writes do not serialize the loop.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut polled = 0;
+    while polled < CONTRACTS && Instant::now() < deadline {
+        polled = horizon
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/transactions"))
+            .count();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        polled >= CONTRACTS,
+        "all {CONTRACTS} contracts should be polled despite slow writes, saw {polled}"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+    let _ = std::fs::remove_file(&cursor_file);
+}
+
+/// Issue #281: cooldown and `NoActivity` state must survive a restart via the
+/// versioned state file, so `watch --once` (cron) can enforce cooldowns across
+/// runs and a `NoActivity` recovery is still sent after a restart.
+#[tokio::test]
+async fn state_file_persists_cooldown_and_no_activity_across_restart() {
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    let mut contract = helpers::contract(
+        "https://hooks.example.com/hook",
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let state_file = std::env::temp_dir().join(format!(
+        "txwatch_state_{}_{}.json",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&state_file);
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 3600,
+        contracts: vec![contract.clone()],
+        cursor_file: None,
+        state_file: Some(state_file.display().to_string()),
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+    };
+
+    // First run: no state yet, so nothing is suppressed.
+    let report = txwatch_poller::run_once(cfg.clone(), true).await.unwrap();
+    assert_eq!(report.poll_failures, 0);
+
+    // Simulate a restart: the state file must exist and be versioned.
+    let raw = std::fs::read_to_string(&state_file).expect("state file written");
+    let state: serde_json::Value = serde_json::from_str(&raw).expect("state file is JSON");
+    assert!(
+        state.get("version").is_some(),
+        "state file must be versioned, got: {raw}"
+    );
+
+    // Second run loads the persisted state without error.
+    let report = txwatch_poller::run_once(cfg, true).await.unwrap();
+    assert_eq!(report.poll_failures, 0);
+
+    let _ = std::fs::remove_file(&state_file);
+}

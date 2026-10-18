@@ -29,6 +29,11 @@ pub mod db_snapshot;
 pub use db_snapshot::{PostgresSnapshotRoutine, SnapshotMetadata};
 pub mod event_stream;
 pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
+pub mod persistence;
+pub use persistence::{
+    acquire_state_lock, load_state, save_state, spawn_state_writer, StateDocument, StateHandle,
+    StateWriter,
+};
 pub mod plan_cache;
 pub use plan_cache::{PlanCache, PlanStatistics};
 mod poll_health;
@@ -117,6 +122,27 @@ fn contract_function_name(parameters: &[HorizonParameter]) -> Option<String> {
     let end = 8usize.checked_add(len)?;
     let bytes = raw.get(8..end)?;
     std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+/// Internal parsers exposed for the fuzz targets in `fuzz/`. Not a public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub fn parse_stroops(amount: &str) -> Option<u64> {
+        super::parse_stroops(amount).ok()
+    }
+
+    pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+        super::base64_decode(input)
+    }
+
+    /// Decodes `value` as the base64 XDR of a `Sym` invocation parameter.
+    pub fn contract_function_name(value: &str) -> Option<String> {
+        super::contract_function_name(&[super::HorizonParameter {
+            scv_type: "Sym".to_owned(),
+            value: value.to_owned(),
+        }])
+    }
 }
 
 /// Minimal standard-alphabet base64 decoder, so the poller does not need a
@@ -256,17 +282,20 @@ struct Counters {
     interval_transactions: AtomicU64,
     interval_alerts: AtomicU64,
     interval_skipped: AtomicU64,
+    interval_suppressed: AtomicU64,
 }
 
 impl Counters {
     /// Adds the outcome of one poll of one contract to the running totals.
-    fn record_poll(&self, txs: u64, alerts: u64, skipped: u64) {
+    fn record_poll(&self, txs: u64, alerts: u64, skipped: u64, suppressed: u64) {
         self.transactions.fetch_add(txs, Ordering::Relaxed);
         self.alerts.fetch_add(alerts, Ordering::Relaxed);
         self.skipped.fetch_add(skipped, Ordering::Relaxed);
         self.interval_transactions.fetch_add(txs, Ordering::Relaxed);
         self.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
         self.interval_skipped.fetch_add(skipped, Ordering::Relaxed);
+        self.interval_suppressed
+            .fetch_add(suppressed, Ordering::Relaxed);
     }
 }
 
@@ -311,10 +340,32 @@ pub async fn run_with_reload(
 ) -> Result<()> {
     // `build_poll_client` applies `http_tcp_keepalive_secs` itself.
     let client = build_poll_client(&cfg)?;
+    // Issue #279: take an exclusive advisory lock on `<cursor_file>.lock` so a
+    // second instance pointed at the same file fails fast instead of silently
+    // overwriting our cursors. The guard lives for the whole process.
+    let _state_lock = acquire_state_lock(cfg.cursor_file.as_deref())?;
+    // Issue #281: load the versioned state document (cursors, cooldowns and
+    // NoActivity states), migrating a legacy cursor-only file if needed.
+    let loaded = load_state(&cfg);
     // Shared so each contract's task can persist the whole cursor map after a
     // cycle that advanced its own cursor.
-    let cursors = Arc::new(Mutex::new(load_cursors(&cfg)));
+    let cursors = Arc::new(Mutex::new(loaded.cursors.clone()));
+    // Issue #278: a single coalescing writer task owns the fsync path, so no
+    // poll task blocks a worker on synchronous disk I/O.
+    let state_writer = spawn_state_writer(cfg.cursor_file.as_deref());
+    let state_handle = state_writer.handle();
+    let cooldown_state = Arc::new(Mutex::new(loaded.cooldowns.clone()));
+    let no_activity_state = Arc::new(Mutex::new(loaded.no_activity.clone()));
     let cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
+    let cursors = Arc::new(Mutex::new(load_cursors(&cfg)));
+    // Issue #275: per-contract runtime state (cooldowns, poll state, health)
+    // lives here, keyed by `cursor_key`, so it survives config reloads instead
+    // of being recreated with every generation of polling tasks.
+    let runtime_states: Arc<Mutex<HashMap<String, ContractRuntimeState>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    // Issue #276: the persistence path is recomputed from the active config
+    // each generation rather than captured once here.
+    let mut cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
 
     #[cfg(feature = "metrics")]
     {
@@ -386,6 +437,7 @@ pub async fn run_with_reload(
                     let interval_txs = c.interval_transactions.swap(0, Ordering::Relaxed);
                     let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
                     let interval_skipped = c.interval_skipped.swap(0, Ordering::Relaxed);
+                    let interval_suppressed = c.interval_suppressed.swap(0, Ordering::Relaxed);
                     info!(
                         contracts = c.contracts.load(Ordering::Relaxed),
                         transactions_total = c.transactions.load(Ordering::Relaxed),
@@ -394,6 +446,7 @@ pub async fn run_with_reload(
                         transactions_interval = interval_txs,
                         alerts_interval = interval_alerts,
                         skipped_interval = interval_skipped,
+                        suppressed_interval = interval_suppressed,
                         "60-second summary"
                     );
                 }
@@ -418,6 +471,30 @@ pub async fn run_with_reload(
             }
             let interval =
                 Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
+            let key = contract.cursor_key();
+            // Issue #275: reuse the runtime state of a contract that is still
+            // configured with the same rules; only reset it when the rules
+            // actually changed (or the contract is new).
+            let state = {
+                let mut states = lock(&runtime_states);
+                match states.get(&key) {
+                    Some(existing) if existing.rules == contract.rules => existing.clone(),
+                    Some(_) => {
+                        info!(
+                            contract = %contract.label,
+                            "rules changed on reload — resetting cooldowns and poll state"
+                        );
+                        let fresh = ContractRuntimeState::new(contract);
+                        states.insert(key.clone(), fresh.clone());
+                        fresh
+                    }
+                    None => {
+                        let fresh = ContractRuntimeState::new(contract);
+                        states.insert(key.clone(), fresh.clone());
+                        fresh
+                    }
+                }
+            };
             tasks.spawn(poll_contract_forever(
                 client.clone(),
                 contract.clone(),
@@ -429,7 +506,11 @@ pub async fn run_with_reload(
                 CursorPersistence {
                     cursors: Arc::clone(&cursors),
                     path: cursor_file.clone(),
+                    writer: state_handle.clone(),
+                    cooldowns: Arc::clone(&cooldown_state),
+                    no_activity: Arc::clone(&no_activity_state),
                 },
+                state,
             ));
         }
 
@@ -442,8 +523,9 @@ pub async fn run_with_reload(
         let _ = stop_tx.send(true);
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((key, cursor)) => {
-                    lock(&cursors).insert(key, cursor);
+                Ok((key, cursor, state)) => {
+                    lock(&cursors).insert(key.clone(), cursor);
+                    lock(&runtime_states).insert(key, state);
                 }
                 Err(e) => error!(error = ?e, "contract polling task panicked"),
             }
@@ -453,30 +535,75 @@ pub async fn run_with_reload(
         if let Err(e) = save_cursors(&cfg, &lock(&cursors)) {
             error!(error = %e, "failed to flush cursors on shutdown");
         }
+        // Issue #278: drain the coalescing writer so the final state is durable.
+        state_handle.flush().await;
 
         let Some(new_cfg) = new_cfg else { break };
+        let start = load_state(&new_cfg).cursors;
         let start = load_cursors(&new_cfg);
+        // Issue #277: keep cursors for contracts that are no longer configured
+        // so that temporarily removing and re-adding a contract does not lose
+        // every transaction in between.
+        let mut merged: HashMap<String, String> = lock(&cursors).clone();
+        for (key, cursor) in start {
+            merged.entry(key).or_insert(cursor);
+        }
         // Existing cursors win over the reloaded config's file; contracts new
         // to the config start from the saved cursor, else `now`.
-        let merged: HashMap<String, String> = new_cfg
-            .contracts
-            .iter()
-            .map(|c| {
-                let key = c.cursor_key();
-                let cursor = lock(&cursors)
-                    .get(&key)
-                    .or_else(|| start.get(&key))
-                    .cloned()
-                    .unwrap_or_else(|| "now".to_string());
-                (key, cursor)
-            })
-            .collect();
+        for c in &new_cfg.contracts {
+            merged
+                .entry(c.cursor_key())
+                .or_insert_with(|| "now".to_string());
+        }
         *lock(&cursors) = merged;
+
+        // Issue #276: recompute the persistence path from the new config and
+        // migrate the cursor file when the path changed.
+        let new_cursor_file = new_cfg.cursor_file.clone().map(PathBuf::from);
+        if new_cursor_file != cursor_file {
+            match (&cursor_file, &new_cursor_file) {
+                (Some(old), Some(new)) => {
+                    warn!(
+                        old_path = %old.display(),
+                        new_path = %new.display(),
+                        "cursor_file changed on reload — migrating saved cursors"
+                    );
+                    if let Err(e) = write_cursor_file(new, &lock(&cursors)) {
+                        error!(error = %e, "failed to migrate cursors to the new cursor_file");
+                    }
+                }
+                (Some(old), None) => warn!(
+                    old_path = %old.display(),
+                    "cursor_file removed on reload — cursors will no longer be persisted"
+                ),
+                (None, Some(new)) => info!(
+                    new_path = %new.display(),
+                    "cursor_file added on reload — cursors will now be persisted"
+                ),
+                (None, None) => {}
+            }
+            cursor_file = new_cursor_file;
+        }
+
         counters
             .contracts
             .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
-        metrics::set_poll_interval(new_cfg.poll_interval_seconds);
+        {
+            metrics::set_poll_interval(new_cfg.poll_interval_seconds);
+            // Drop the series of contracts no longer polled under the same
+            // label and network, or freshness alerts would fire for them forever.
+            for old in cfg.contracts.iter().filter(|c| c.enabled) {
+                let network = old.network.as_str();
+                let still_polled = new_cfg
+                    .contracts
+                    .iter()
+                    .any(|c| c.enabled && c.label == old.label && c.network.as_str() == network);
+                if !still_polled {
+                    metrics::remove_contract(&old.label, network);
+                }
+            }
+        }
         info!(
             contracts = new_cfg.contracts.len(),
             interval_secs = new_cfg.poll_interval_seconds,
@@ -484,6 +611,9 @@ pub async fn run_with_reload(
         );
         cfg = new_cfg;
     }
+
+    // Issue #278: stop the writer task and wait for its final flush.
+    state_writer.shutdown().await;
 
     info!("TxWatch polling engine stopped cleanly");
     Ok(())
@@ -511,9 +641,33 @@ fn log_poll_failure(contract: &WatchedContract, consecutive_failures: u32, error
     );
 }
 
+/// Per-contract runtime state that must survive config reloads (issue #275):
+/// cooldowns, poll state (`last_seen`, `NoActivity` states, warning suppressor)
+/// and health. It is handed back to the reload loop when a task ends so the
+/// next generation can reuse it.
+#[derive(Clone)]
+struct ContractRuntimeState {
+    /// The rules this state was built for; a change resets the state.
+    rules: Vec<txwatch_config::RuleConfig>,
+    state: ContractPollState,
+    cooldowns: CooldownTracker,
+    health: PollHealth,
+}
+
+impl ContractRuntimeState {
+    fn new(contract: &WatchedContract) -> Self {
+        Self {
+            rules: contract.rules.clone(),
+            state: ContractPollState::default(),
+            cooldowns: CooldownTracker::new(),
+            health: PollHealth::default(),
+        }
+    }
+}
+
 /// Polls one contract every `interval` until `stop` reports `true`, finishing
-/// the in-flight poll first. Returns the contract's cursor key and its latest
-/// cursor.
+/// the in-flight poll first. Returns the contract's cursor key, its latest
+/// cursor and its runtime state.
 #[allow(clippy::too_many_arguments)]
 async fn poll_contract_forever(
     client: Client,
@@ -524,19 +678,38 @@ async fn poll_contract_forever(
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
     persist: CursorPersistence,
-) -> (String, String) {
+    runtime: ContractRuntimeState,
+) -> (String, String, ContractRuntimeState) {
     let key = contract.cursor_key();
     let cursor = lock(&persist.cursors)
         .get(&key)
         .cloned()
         .unwrap_or_else(|| "now".to_string());
     let mut cursors = HashMap::from([(key.clone(), cursor)]);
+    // Poll state and cooldowns live as long as this contract's task, and are
+    // carried across reloads via `runtime`.
+    let ContractRuntimeState {
+        rules,
+        mut state,
+        mut cooldowns,
+        mut health,
+    } = runtime;
     // Poll state and cooldowns live as long as this contract's task.
     let mut state = ContractPollState::default();
+    // Issue #281: restore this contract's NoActivity states from the persisted
+    // document so a restart does not re-fire open incidents.
+    if let Some(saved) = lock(&persist.no_activity).get(&key) {
+        state.no_activity_states = saved.clone();
+    }
     // A single tracker for this contract's lifetime, so cooldowns survive
     // across poll cycles rather than deduping only within one.
     let mut cooldowns = CooldownTracker::new();
+    // Issue #281: restore persisted cooldown windows for this contract.
+    if let Some(saved) = lock(&persist.cooldowns).get(&key) {
+        cooldowns = saved.clone();
+    }
     let mut health = PollHealth::default();
+    let lag_threshold = ledger_lag_warn_threshold_from_env();
     // Polls are paced by a fixed-period ticker, so the period stays at
     // `interval` however long a cycle takes. The first poll happens
     // immediately; the per-contract offset staggers every poll after it so
@@ -567,7 +740,20 @@ async fn poll_contract_forever(
                         "contract recovered"
                     );
                 }
-                counters.record_poll(txs, alerts, skipped);
+                counters.record_poll(txs, alerts, skipped, state.suppressed);
+                if let Some(lag) = ledger_lag(&client, &contract, &state).await {
+                    if lag > lag_threshold {
+                        warn!(
+                            contract = %contract.label,
+                            network = %contract.network.as_str(),
+                            ledger_lag = lag,
+                            threshold = lag_threshold,
+                            "contract is falling behind the network tip"
+                        );
+                    }
+                    #[cfg(feature = "metrics")]
+                    metrics::set_ledger_lag(&contract.label, contract.network.as_str(), lag);
+                }
                 // Issue #25: increment Prometheus counters when metrics feature is enabled.
                 #[cfg(feature = "metrics")]
                 {
@@ -580,17 +766,34 @@ async fn poll_contract_forever(
                 }
                 // Issue #5: persist the cursor as soon as it advances, so a
                 // restart does not replay transactions we have already seen.
-                if let Some(path) = &persist.path {
+                // Issue #278: hand the update to the coalescing writer task
+                // instead of doing synchronous disk I/O on this worker.
+                if persist.path.is_some() {
                     if let Some(latest) = cursors.get(&key) {
-                        let mut guard = lock(&persist.cursors);
-                        if guard.get(&key) != Some(latest) {
-                            guard.insert(key.clone(), latest.clone());
-                            if let Err(e) = write_cursor_file(path, &guard) {
-                                error!(
-                                    contract = %contract.label, error = %e,
-                                    "failed to persist cursor file; cursors may be replayed after a restart"
-                                );
+                        // Scope the lock so no guard is held across an await.
+                        let changed = {
+                            let mut guard = lock(&persist.cursors);
+                            if guard.get(&key) == Some(latest) {
+                                false
+                            } else {
+                                guard.insert(key.clone(), latest.clone());
+                                true
                             }
+                        };
+                        if changed {
+                            // Issue #281: snapshot cooldown and NoActivity state
+                            // alongside the cursor so it survives a restart.
+                            let cooldowns = lock(&persist.cooldowns)
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_default();
+                            let no_activity = state.no_activity_states.clone();
+                            persist.writer.send(persistence::StateUpdate {
+                                cursor_key: key.clone(),
+                                cursor: latest.clone(),
+                                cooldowns,
+                                no_activity,
+                            });
                         }
                     }
                 }
@@ -639,8 +842,28 @@ async fn poll_contract_forever(
         }
     }
 
+    // Issue #281: remember this contract's cooldown and NoActivity state for
+    // the next generation of tasks (e.g. after a config reload).
+    {
+        let mut guard = lock(&persist.cooldowns);
+        guard.insert(key.clone(), cooldowns.clone());
+    }
+    {
+        let mut guard = lock(&persist.no_activity);
+        guard.insert(key.clone(), state.no_activity_states.clone());
+    }
+
     let cursor = cursors.remove(&key).unwrap_or_else(|| "now".to_string());
-    (key, cursor)
+    (
+        key,
+        cursor,
+        ContractRuntimeState {
+            rules,
+            state,
+            cooldowns,
+            health,
+        },
+    )
 }
 
 /// Reads the raw cursor map from `path`. An unreadable or unparseable file is
@@ -746,6 +969,12 @@ struct CursorPersistence {
     cursors: Arc<Mutex<HashMap<String, String>>>,
     /// `None` when `cursor_file` is not configured.
     path: Option<PathBuf>,
+    /// Issue #278: coalescing writer task that owns the fsync path.
+    writer: StateHandle,
+    /// Issue #281: persisted cooldown windows, keyed by cursor key.
+    cooldowns: Arc<Mutex<HashMap<String, CooldownTracker>>>,
+    /// Issue #281: persisted NoActivity states, keyed by cursor key.
+    no_activity: Arc<Mutex<HashMap<String, Vec<NoActivityState>>>>,
 }
 
 /// Lock a mutex, recovering the contents if a previous holder panicked.
@@ -757,27 +986,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// is written and fsynced, then renamed over the target, and the directory is
 /// fsynced so the rename itself survives a crash. An interrupted write
 /// therefore leaves the previous file intact rather than a truncated one.
+///
+/// Issue #278: this is synchronous and must only be called from a blocking
+/// context (see [`persistence::write_state_blocking`]).
 fn write_cursor_file(path: &Path, cursors: &HashMap<String, String>) -> Result<()> {
-    let raw = serde_json::to_string_pretty(cursors).context("failed to serialize cursors")?;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp)
-            .with_context(|| format!("failed to create cursor file '{}'", tmp.display()))?;
-        f.write_all(raw.as_bytes())
-            .with_context(|| format!("failed to write cursor file '{}'", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("failed to sync cursor file '{}'", tmp.display()))?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to replace cursor file '{}'", path.display()))?;
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        // Persist the rename itself. Failure here is not fatal: the data is
-        // already durable, only the directory entry may be lost on a crash.
-        if let Ok(handle) = fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
-    }
-    Ok(())
+    let doc = StateDocument::from_cursors(cursors.clone());
+    persistence::write_state_blocking(path, &doc)
 }
 
 fn build_poll_client(cfg: &AppConfig) -> Result<Client> {
@@ -814,44 +1028,96 @@ impl CycleReport {
 /// `cfg.cursor_file` (if set) and return what happened. Used by
 /// `txwatch watch --once` for cron/CI/scheduler runs.
 pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
-    let client = build_poll_client(&cfg)?;
-    let mut cursors = load_cursors(&cfg);
-    let max_pages = cfg.effective_max_pages_per_cycle();
-    let mut report = CycleReport::default();
-    // A single cycle: cooldowns only dedupe within this run.
-    let mut cooldowns = CooldownTracker::new();
+    run_once_with_concurrency(cfg, dry_run, cfg.effective_concurrency()).await
+}
 
-    for contract in &cfg.contracts {
-        if !contract.enabled {
-            info!(contract = %contract.label, "contract is disabled — skipping");
-            continue;
-        }
+/// Like [`run_once`], but polls at most `concurrency` contracts at a time.
+///
+/// Issue #280: contracts are polled concurrently (bounded by `concurrency`)
+/// rather than one after another, so a cron run with many contracts and slow
+/// Horizon responses does not overrun its schedule.
+pub async fn run_once_with_concurrency(
+    cfg: AppConfig,
+    dry_run: bool,
+    concurrency: usize,
+) -> Result<CycleReport> {
+    let client = build_poll_client(&cfg)?;
+    // Issue #279: fail fast if another instance shares this cursor file.
+    let _state_lock = acquire_state_lock(cfg.cursor_file.as_deref())?;
+    // Issue #281: load cursors, cooldowns and NoActivity states so a cron run
+    // enforces cooldowns across runs and does not re-fire open incidents.
+    let loaded = load_state(&cfg);
+    let mut cursors = loaded.cursors;
+    let max_pages = cfg.effective_max_pages_per_cycle();
+    let concurrency = concurrency.max(1);
+
+    // Per-contract cooldown trackers and NoActivity states, seeded from the
+    // persisted document.
+    let mut cooldowns: HashMap<String, CooldownTracker> = loaded.cooldowns;
+    let mut no_activity: HashMap<String, Vec<NoActivityState>> = loaded.no_activity;
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut tasks = JoinSet::new();
+    for contract in cfg.contracts.iter().filter(|c| c.enabled).cloned() {
+        let client = client.clone();
+        let permit = Arc::clone(&semaphore);
+        let key = contract.cursor_key();
+        let cursor = cursors
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| "now".to_string());
+        let mut contract_cursors = HashMap::from([(key.clone(), cursor)]);
         let mut state = ContractPollState::default();
-        match poll_contract(
-            &client,
-            &HorizonSource::new(&client, poll_base_url(contract)),
-            contract,
-            &mut cursors,
-            &mut state,
-            &mut cooldowns,
-            max_pages,
-            dry_run,
-        )
-        .await
-        {
-            Ok((txs, alerts, webhook_failures, _skipped)) => {
-                report.transactions += txs;
-                report.alerts += alerts;
-                report.webhook_failures += webhook_failures;
+        state.no_activity_states = no_activity.remove(&key).unwrap_or_default();
+        let mut tracker = cooldowns.remove(&key).unwrap_or_default();
+        tasks.spawn(async move {
+            let _permit = permit.acquire_owned().await;
+            let result = poll_contract(
+                &client,
+                &HorizonSource::new(&client, poll_base_url(&contract)),
+                &contract,
+                &mut contract_cursors,
+                &mut state,
+                &mut tracker,
+                max_pages,
+                dry_run,
+            )
+            .await;
+            (key, contract, contract_cursors, state, tracker, result)
+        });
+    }
+
+    let mut report = CycleReport::default();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((key, contract, contract_cursors, state, tracker, result)) => {
+                if let Some(cursor) = contract_cursors.get(&key) {
+                    cursors.insert(key.clone(), cursor.clone());
+                }
+                cooldowns.insert(key.clone(), tracker);
+                no_activity.insert(key.clone(), state.no_activity_states);
+                match result {
+                    Ok((txs, alerts, webhook_failures, _skipped)) => {
+                        report.transactions += txs;
+                        report.alerts += alerts;
+                        report.webhook_failures += webhook_failures;
+                    }
+                    Err(e) => {
+                        log_poll_failure(&contract, 1, &e);
+                        report.poll_failures += 1;
+                    }
+                }
             }
             Err(e) => {
-                log_poll_failure(contract, 1, &e);
+                error!(error = ?e, "contract polling task panicked");
                 report.poll_failures += 1;
             }
         }
     }
 
-    save_cursors(&cfg, &cursors)?;
+    // Issue #281: persist cursors, cooldowns and NoActivity states together.
+    let doc = StateDocument::from_parts(cursors, cooldowns, no_activity);
+    save_state(&cfg, &doc)?;
     Ok(report)
 }
 
@@ -1070,6 +1336,58 @@ pub struct ContractPollState {
     pub no_activity_states: Vec<NoActivityState>,
     /// Suppresses repeated evaluation warnings for broken rules.
     pub suppressor: WarningSuppressor,
+    /// Rule matches dropped by a cooldown in the last poll cycle.
+    pub suppressed: u64,
+    /// Ledger of the last processed transaction, if Horizon reported one.
+    pub last_ledger: Option<u32>,
+    /// Whether the last poll cycle stopped with transactions still pending.
+    pub backlogged: bool,
+}
+
+/// Env var holding the ledger lag above which a warning is logged.
+const LEDGER_LAG_WARN_ENV: &str = "TXWATCH_LEDGER_LAG_WARN_THRESHOLD";
+/// About an hour of ledgers at ~5 s each.
+const DEFAULT_LEDGER_LAG_WARN_THRESHOLD: u64 = 720;
+
+fn ledger_lag_warn_threshold_from_env() -> u64 {
+    std::env::var(LEDGER_LAG_WARN_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LEDGER_LAG_WARN_THRESHOLD)
+}
+
+/// Ledgers between Horizon's latest ledger and the last processed
+/// transaction. `0` when the last cycle drained everything pending; `None`
+/// when the lag cannot be determined. Horizon is only asked when behind.
+async fn ledger_lag(
+    client: &Client,
+    contract: &WatchedContract,
+    state: &ContractPollState,
+) -> Option<u64> {
+    if !state.backlogged {
+        return Some(0);
+    }
+    let last = state.last_ledger?;
+    let url = format!("{}/", poll_base_url(contract));
+    let latest = async {
+        let root: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::Ok(root["history_latest_ledger"].as_u64())
+    }
+    .await;
+    match latest {
+        Ok(Some(latest)) => Some(latest.saturating_sub(u64::from(last))),
+        Ok(None) => None,
+        Err(error) => {
+            debug!(contract = %contract.label, error = %error, "could not fetch Horizon's latest ledger");
+            None
+        }
+    }
 }
 
 /// Returns `(transactions_processed, alerts_fired, webhook_failures, transactions_skipped)`.
@@ -1200,6 +1518,8 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
     let mut skipped = 0u64;
+    state.suppressed = 0;
+    state.backlogged = false;
     // Contract events per ledger, fetched at most once per cycle and only
     // when the contract has an EventEmitted rule.
     let mut events_by_ledger: HashMap<u32, Vec<RpcEvent>> = HashMap::new();
@@ -1226,6 +1546,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 "reached max_pages_per_cycle; more transactions may be pending — continuing \
                  from the saved cursor next cycle"
             );
+            state.backlogged = true;
             break;
         }
 
@@ -1245,6 +1566,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                     error = %error,
                     "failed to fetch a later page; continuing from the saved cursor next cycle"
                 );
+                state.backlogged = true;
                 break;
             }
         };
@@ -1303,6 +1625,10 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
 
             let ledger = record.tx.ledger;
             let mut enriched = match EnrichedTransaction::from_horizon(
+            if ledger.is_some() {
+                state.last_ledger = ledger;
+            }
+            let enriched = match EnrichedTransaction::from_horizon(
                 record.tx,
                 details.function_names,
                 amount_stroops,
@@ -1357,7 +1683,29 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 debug!(contract = %contract.label, tx = %tx_hash,
                     "transaction evaluated but no rules matched");
             }
+            let mut matched: Vec<(String, String)> = payloads
+                .iter()
+                .map(|p| (p.rule_triggered.clone(), p.rule_type.clone()))
+                .collect();
             let payloads = cooldowns.apply(&contract.rules, payloads, chrono::Utc::now());
+            for payload in &payloads {
+                if let Some(i) = matched
+                    .iter()
+                    .position(|(rule, _)| *rule == payload.rule_triggered)
+                {
+                    matched.swap_remove(i);
+                }
+            }
+            // What is left in `matched` was dropped by a cooldown.
+            state.suppressed += matched.len() as u64;
+            #[cfg(feature = "metrics")]
+            for (_, rule_type) in &matched {
+                metrics::inc_alerts_suppressed(
+                    &contract.label,
+                    contract.network.as_str(),
+                    rule_type,
+                );
+            }
 
             for payload in payloads {
                 alert_count += 1;
@@ -1439,8 +1787,15 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             shutdown_rx,
         )
         .await;
+        // Batches always go to the `webhook_url` shorthand in the txwatch format.
         #[cfg(feature = "metrics")]
-        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+        metrics::record_webhook_delivery(
+            &contract.label,
+            "txwatch",
+            "0",
+            delivery.is_ok(),
+            started.elapsed().as_secs_f64(),
+        );
         if let Err(e) = delivery {
             error!(contract = %contract.label, alerts = chunk.len(), error = %e,
                 "batched webhook delivery failed");
@@ -1501,6 +1856,10 @@ async fn deliver_payload(
         warn!(contract = %contract.label, "no webhook destination configured — dropping alert");
         return;
     }
+    let destinations: Vec<WebhookDestination> = destinations
+        .into_iter()
+        .filter(|d| d.accepts(payload.severity.as_deref(), &payload.rule_type))
+        .collect();
 
     *webhook_failures += deliver_to_all(client, contract, &destinations, payload).await;
 }
@@ -1514,15 +1873,26 @@ async fn deliver_to_all(
     destinations: &[WebhookDestination],
     payload: &txwatch_rules::AlertPayload,
 ) -> u64 {
-    let deliveries = destinations.iter().map(|destination| async move {
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        #[cfg(feature = "metrics")]
-        let started = std::time::Instant::now();
-        let delivery = send_to_destination(client, destination, payload, shutdown_rx).await;
-        #[cfg(feature = "metrics")]
-        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
-        (destination, delivery)
-    });
+    let deliveries = destinations
+        .iter()
+        .enumerate()
+        .map(|(index, destination)| async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            #[cfg(feature = "metrics")]
+            let started = std::time::Instant::now();
+            let delivery = send_to_destination(client, destination, payload, shutdown_rx).await;
+            #[cfg(feature = "metrics")]
+            metrics::record_webhook_delivery(
+                &contract.label,
+                &destination.format.to_string(),
+                &index.to_string(),
+                delivery.is_ok(),
+                started.elapsed().as_secs_f64(),
+            );
+            #[cfg(not(feature = "metrics"))]
+            let _ = index;
+            (destination, delivery)
+        });
 
     let mut failures = 0;
     for (destination, delivery) in futures::future::join_all(deliveries).await {

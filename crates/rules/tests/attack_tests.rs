@@ -356,4 +356,55 @@ fn test_attack_contract_upgraded_reports_wasm_hashes() {
         payloads.is_empty(),
         "ContractUpgraded must not fire without an executable change"
     );
+#[test]
+fn test_attack_rule_level_webhook_secret_only_override() {
+    // A rule that sets only `webhook_secret` (no `webhook_url`) must still have
+    // its secret applied to the relevant destination(s) rather than being
+    // silently discarded by the `(None, _)` match arm.
+    let raw = dummy_tx("secret_only_tx", false, None);
+    let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+
+    let rules = vec![RuleConfig {
+        rule: AlertRule::TransactionFailed,
+        cooldown_seconds: None,
+    }];
+    let ctx = EvalContext {
+        label: "Escrow",
+        contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        network: "testnet",
+        horizon_base: "https://horizon-testnet.stellar.org",
+        explorer_base: Some("https://stellar.expert/explorer/testnet"),
+    };
+
+    let payloads = evaluate(&ctx, &rules, &enriched, None);
+    assert_eq!(payloads.len(), 1, "TransactionFailed must fire on failed tx");
+
+    let payload = &payloads[0];
+    let destinations = payload
+        .destinations()
+        .expect("payload must expose its destinations");
+    assert!(
+        !destinations.is_empty(),
+        "contract destinations must be present when no rule override is set"
+    );
+
+    // Apply a secret-only override and confirm every destination carries the
+    // rule-level secret instead of the contract-level one.
+    let rule_secret = "rule-level-signing-key";
+    let overridden = payload.with_webhook_secret_override(rule_secret);
+    let overridden_destinations = overridden
+        .destinations()
+        .expect("overridden payload must expose its destinations");
+    assert_eq!(
+        overridden_destinations.len(),
+        destinations.len(),
+        "secret-only override must not change the destination set"
+    );
+    for dest in overridden_destinations {
+        assert_eq!(
+            dest.webhook_secret.as_deref(),
+            Some(rule_secret),
+            "rule-level webhook_secret must be applied to every destination"
+        );
+    }
 }
