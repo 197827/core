@@ -6,6 +6,7 @@
 //! - `txwatch_transactions_skipped_total{contract,network}` — transactions dropped because they could not be enriched
 //! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
 //! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
+//! - `txwatch_horizon_rate_limited_total{contract,network}` — Horizon 429 (rate limited) responses
 //! - `txwatch_webhook_delivery_duration_seconds`         — webhook delivery latency (incl. retries)
 //! - `txwatch_last_successful_poll_timestamp_seconds{contract,network}` — data freshness
 //! - `txwatch_consecutive_poll_failures{contract,network}` — current failure streak
@@ -92,6 +93,18 @@ fn webhook_failures_total() -> &'static IntCounterVec {
             CONTRACT_LABELS
         )
         .expect("register txwatch_webhook_failures_total")
+    })
+}
+
+fn horizon_rate_limited_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_horizon_rate_limited_total",
+            "Total Horizon HTTP 429 (rate limited) responses, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_horizon_rate_limited_total")
     })
 }
 
@@ -188,6 +201,13 @@ pub fn inc_alerts(contract: &str, network: &str, n: u64) {
 /// Increment `txwatch_webhook_failures_total` for a contract by 1.
 pub fn inc_webhook_failures(contract: &str, network: &str) {
     webhook_failures_total()
+        .with_label_values(&[contract, network])
+        .inc();
+}
+
+/// Increment `txwatch_horizon_rate_limited_total` for a contract by 1.
+pub fn inc_horizon_rate_limited(contract: &str, network: &str) {
+    horizon_rate_limited_total()
         .with_label_values(&[contract, network])
         .inc();
 }

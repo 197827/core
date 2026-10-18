@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use txwatch_config::AppConfig;
-use wiremock::matchers::{method, path_regex, query_param};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
@@ -231,4 +231,95 @@ async fn ambiguous_legacy_cursor_starts_from_now_on_every_network() {
 
     assert_eq!(requested_cursors(&testnet).await, vec!["now"]);
     assert_eq!(requested_cursors(&futurenet).await, vec!["now"]);
+}
+
+/// A Horizon operations page with `count` records and a `next` link.
+fn operations_page(count: usize, next: &str) -> serde_json::Value {
+    let records: Vec<_> = (0..count)
+        .map(|n| json!({ "id": n.to_string(), "type": "invoke_host_function" }))
+        .collect();
+    json!({
+        "_embedded": { "records": records },
+        "_links": { "next": { "href": next } }
+    })
+}
+
+/// The `cursor` query parameter of every operations request the server saw.
+async fn requested_operation_cursors(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/operations"))
+        .filter_map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "cursor")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn fetch_soroban_details_follows_next_link() {
+    let server = MockServer::start().await;
+    let limit = txwatch_poller::OPERATIONS_PAGE_LIMIT;
+    let tx_hash = "abc123";
+    let ops_path = format!("/transactions/{tx_hash}/operations");
+
+    // First page is full, so `next` must be followed.
+    Mock::given(method("GET"))
+        .and(path(ops_path.clone()))
+        .and(query_param("cursor", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(operations_page(
+            limit,
+            &format!("{}/operations?cursor=page2", server.uri()),
+        )))
+        .mount(&server)
+        .await;
+    // Second page is full too, so `next` must be followed again.
+    Mock::given(method("GET"))
+        .and(path(ops_path.clone()))
+        .and(query_param("cursor", "page2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(operations_page(
+            limit,
+            &format!("{}/operations?cursor=page3", server.uri()),
+        )))
+        .mount(&server)
+        .await;
+    // Third page is short: stop here even though Horizon still sends `next`.
+    Mock::given(method("GET"))
+        .and(path(ops_path.clone()))
+        .and(query_param("cursor", "page3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(operations_page(
+            1,
+            &format!("{}/operations?cursor=page4", server.uri()),
+        )))
+        .mount(&server)
+        .await;
+
+    let details = txwatch_poller::fetch_soroban_details(&server.uri(), tx_hash)
+        .await
+        .unwrap();
+
+    assert_eq!(details.operations.len(), limit * 2 + 1);
+    assert_eq!(
+        requested_operation_cursors(&server).await,
+        vec!["0", "page2", "page3"],
+        "must stop after the short page instead of following `next` to the cap"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let ops_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/operations"))
+        .collect();
+    assert_eq!(ops_requests.len(), 3, "exactly one request per page");
+    for request in ops_requests {
+        assert!(
+            !request.url.query_pairs().any(|(k, _)| k == "join"),
+            "join=operations is ignored by Horizon and must not be sent"
+        );
+    }
 }

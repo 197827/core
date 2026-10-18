@@ -100,9 +100,71 @@ async fn mocked_poll_is_reflected_in_metrics_endpoint() {
         body.contains("txwatch_horizon_request_duration_seconds_count"),
         "{body}"
     );
+    assert!(
+        body.contains("txwatch_horizon_rate_limited_total"),
+        "{body}"
+    );
 
     let ready = reqwest::get(format!("http://{addr}/readyz")).await.unwrap();
     assert_eq!(ready.status(), 200);
     let missing = reqwest::get(format!("http://{addr}/nope")).await.unwrap();
     assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
+async fn horizon_rate_limit_is_reflected_in_metrics_endpoint() {
+    let horizon = MockServer::start().await;
+
+    // Every Horizon page request is rate limited.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&horizon)
+        .await;
+
+    let mut contract = helpers::contract("http://127.0.0.1:1/hook", vec![AlertRule::AnyTransaction]);
+    contract.label = "Rate Limited Contract".into();
+    contract.horizon_base_url_override = Some(horizon.uri());
+    let cfg = AppConfig {
+        poll_interval_seconds: 5,
+        contracts: vec![contract],
+        cursor_file: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+    };
+
+    let (_server_tx, server_rx) = watch::channel(false);
+    let addr = txwatch_poller::serve_metrics("127.0.0.1:0".parse().unwrap(), server_rx)
+        .await
+        .expect("start metrics endpoint");
+
+    let (poller_tx, poller_rx) = watch::channel(false);
+    poller_tx.send(true).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        txwatch_poller::run_with_shutdown(cfg, false, poller_rx),
+    )
+    .await
+    .expect("poll cycle should finish")
+    .expect("poller should succeed");
+
+    let body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .expect("scrape /metrics")
+        .text()
+        .await
+        .unwrap();
+    let labels = r#"{contract="Rate Limited Contract",network="testnet"}"#;
+    assert!(
+        body.contains(&format!("txwatch_horizon_rate_limited_total{labels} 1")),
+        "{body}"
+    );
+    // A rate-limited poll must not be reported as a successful poll.
+    assert!(
+        body.contains(&format!("txwatch_consecutive_poll_failures{labels} 1")),
+        "{body}"
+    );
 }
