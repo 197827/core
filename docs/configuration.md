@@ -26,7 +26,8 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 |-------------------------------|-----------------|----------|---------|-------------|
 | `poll_interval_seconds`       | u64             | no       | `10`    | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. Each contract can override it (see below). |
 | `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive), and each `(network, contract_id)` pair may appear only once. |
-| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. Cursors are keyed `<network>:<contract_id>`; a file written by an older version (keyed by bare contract ID) is migrated automatically, except for a contract ID watched on several networks, which starts from `now`. |
+| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. Cursors are keyed `<network>:<contract_id>`; a file written by an older version (keyed by bare contract ID) is migrated automatically, except for a contract ID watched on several networks, which starts from `now`. See [Cursor file locking and state](#cursor-file-locking-and-state). |
+| `concurrency`                 | usize           | no       | `10`    | Maximum number of contracts polled concurrently by `txwatch watch --once`. Must be 1–1000. `txwatch watch` polls every contract in its own task and ignores this setting. |
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
@@ -34,6 +35,45 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 
 Unknown top-level keys are rejected.
+
+### Cursor file locking and state
+
+When `cursor_file` is set, TxWatch takes an exclusive advisory lock on `<cursor_file>.lock` at startup and
+holds it for the lifetime of the process. If the lock is already held — for example because a second TxWatch
+instance (a rolling deploy that has not finished draining) points at the same `cursor_file` — startup fails
+immediately with an error naming the lock file, instead of letting the two instances overwrite each other's
+cursors and deliver duplicate alerts. The lock is released automatically when the process exits, including on
+a crash.
+
+The cursor file is rewritten atomically: the new contents are written to a unique temporary file in the same
+directory (named after the target file, the process ID and a random suffix) and then renamed over the target.
+Concurrent writers therefore never observe a partially written file, and a `cursor_file` whose name already
+ends in `.tmp` is handled correctly because the scratch path is never the target path.
+
+The file is versioned and holds more than cursors:
+
+```json
+{
+  "version": 2,
+  "cursors": { "testnet:CAAA...": "1234567890" },
+  "cooldowns": { "testnet:CAAA...:LargeTransfer(>=10000XLM)": 1705316096 },
+  "no_activity": { "testnet:CAAA...:NoActivity": { "alerting": true, "since": 1705316096 } }
+}
+```
+
+- `version` — format version. Version `2` is written by current releases.
+- `cursors` — per-contract Horizon cursors, keyed `<network>:<contract_id>`.
+- `cooldowns` — per-contract, per-rule timestamp (Unix seconds) of the last alert sent, so `cooldown_seconds`
+  is enforced across restarts and across separate `txwatch watch --once` runs.
+- `no_activity` — per-contract `NoActivity` state, so an open incident is not re-fired after a restart and a
+  recovery alert is still sent if TxWatch restarted while alerting.
+
+Both `txwatch watch` and `txwatch watch --once` load this state at startup and persist it after each poll cycle.
+
+A file written by an older version — either the legacy cursor-only map (keyed by bare contract ID) or a
+version-1 file with a top-level cursor map — is migrated automatically on load: cursors are re-keyed
+`<network>:<contract_id>` where unambiguous, and cooldown and `NoActivity` state starts empty. As before, a
+contract ID watched on several networks cannot be disambiguated from a legacy file and starts from `now`.
 
 > **Horizon rate limits:** Polling too frequently across many contracts can exhaust Horizon's per-IP request quota,
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
@@ -336,8 +376,10 @@ severity    = "critical"
 
 Every rule accepts an optional `cooldown_seconds` (0–604800). After the rule fires for a contract, further
 matches within that many seconds are suppressed and counted; the next alert that is sent carries the count in
-`suppressed_count`. Unset or `0` disables the cooldown. Cooldown state is kept in memory by `txwatch watch`
-(it resets on restart), so it has no effect across separate `txwatch watch --once` runs.
+`suppressed_count`. Unset or `0` disables the cooldown. Cooldown state is persisted in the `cursor_file` (see
+[Cursor file locking and state](#cursor-file-locking-and-state)) when one is configured, so it is enforced
+across restarts and across separate `txwatch watch --once` runs; without a `cursor_file` it is kept in memory
+and resets on restart.
 
 ```toml
 [[contracts.rules]]
@@ -589,6 +631,13 @@ in an `alerts` array:
 | Variable   | Default | Description                                      |
 |------------|---------|--------------------------------------------------|
 | `RUST_LOG` | `info`  | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+
+## `watch --once` concurrency
+
+`txwatch watch --once` polls contracts concurrently, bounded by the top-level `concurrency` setting (default
+`10`). This keeps a cron run within its schedule even with many contracts and slow Horizon responses. Lower it
+when Horizon rate limits are a concern; raise it when polling your own Horizon. `txwatch watch` is unaffected:
+it already polls every contract in its own task.
 
 ### Environment variable interpolation
 
