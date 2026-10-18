@@ -29,6 +29,11 @@ pub mod db_snapshot;
 pub use db_snapshot::{PostgresSnapshotRoutine, SnapshotMetadata};
 pub mod event_stream;
 pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
+pub mod persistence;
+pub use persistence::{
+    acquire_state_lock, load_state, save_state, spawn_state_writer, StateDocument, StateHandle,
+    StateWriter,
+};
 pub mod plan_cache;
 pub use plan_cache::{PlanCache, PlanStatistics};
 mod poll_health;
@@ -297,9 +302,22 @@ pub async fn run_with_reload(
 ) -> Result<()> {
     // `build_poll_client` applies `http_tcp_keepalive_secs` itself.
     let client = build_poll_client(&cfg)?;
+    // Issue #279: take an exclusive advisory lock on `<cursor_file>.lock` so a
+    // second instance pointed at the same file fails fast instead of silently
+    // overwriting our cursors. The guard lives for the whole process.
+    let _state_lock = acquire_state_lock(cfg.cursor_file.as_deref())?;
+    // Issue #281: load the versioned state document (cursors, cooldowns and
+    // NoActivity states), migrating a legacy cursor-only file if needed.
+    let loaded = load_state(&cfg);
     // Shared so each contract's task can persist the whole cursor map after a
     // cycle that advanced its own cursor.
-    let cursors = Arc::new(Mutex::new(load_cursors(&cfg)));
+    let cursors = Arc::new(Mutex::new(loaded.cursors.clone()));
+    // Issue #278: a single coalescing writer task owns the fsync path, so no
+    // poll task blocks a worker on synchronous disk I/O.
+    let state_writer = spawn_state_writer(cfg.cursor_file.as_deref());
+    let state_handle = state_writer.handle();
+    let cooldown_state = Arc::new(Mutex::new(loaded.cooldowns.clone()));
+    let no_activity_state = Arc::new(Mutex::new(loaded.no_activity.clone()));
     let cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
 
     #[cfg(feature = "metrics")]
@@ -415,6 +433,9 @@ pub async fn run_with_reload(
                 CursorPersistence {
                     cursors: Arc::clone(&cursors),
                     path: cursor_file.clone(),
+                    writer: state_handle.clone(),
+                    cooldowns: Arc::clone(&cooldown_state),
+                    no_activity: Arc::clone(&no_activity_state),
                 },
             ));
         }
@@ -439,9 +460,11 @@ pub async fn run_with_reload(
         if let Err(e) = save_cursors(&cfg, &lock(&cursors)) {
             error!(error = %e, "failed to flush cursors on shutdown");
         }
+        // Issue #278: drain the coalescing writer so the final state is durable.
+        state_handle.flush().await;
 
         let Some(new_cfg) = new_cfg else { break };
-        let start = load_cursors(&new_cfg);
+        let start = load_state(&new_cfg).cursors;
         // Existing cursors win over the reloaded config's file; contracts new
         // to the config start from the saved cursor, else `now`.
         let merged: HashMap<String, String> = new_cfg
@@ -470,6 +493,9 @@ pub async fn run_with_reload(
         );
         cfg = new_cfg;
     }
+
+    // Issue #278: stop the writer task and wait for its final flush.
+    state_writer.shutdown().await;
 
     info!("TxWatch polling engine stopped cleanly");
     Ok(())
@@ -519,9 +545,18 @@ async fn poll_contract_forever(
     let mut cursors = HashMap::from([(key.clone(), cursor)]);
     // Poll state and cooldowns live as long as this contract's task.
     let mut state = ContractPollState::default();
+    // Issue #281: restore this contract's NoActivity states from the persisted
+    // document so a restart does not re-fire open incidents.
+    if let Some(saved) = lock(&persist.no_activity).get(&key) {
+        state.no_activity_states = saved.clone();
+    }
     // A single tracker for this contract's lifetime, so cooldowns survive
     // across poll cycles rather than deduping only within one.
     let mut cooldowns = CooldownTracker::new();
+    // Issue #281: restore persisted cooldown windows for this contract.
+    if let Some(saved) = lock(&persist.cooldowns).get(&key) {
+        cooldowns = saved.clone();
+    }
     let mut health = PollHealth::default();
     // Polls are paced by a fixed-period ticker, so the period stays at
     // `interval` however long a cycle takes. The first poll happens
@@ -566,17 +601,34 @@ async fn poll_contract_forever(
                 }
                 // Issue #5: persist the cursor as soon as it advances, so a
                 // restart does not replay transactions we have already seen.
-                if let Some(path) = &persist.path {
+                // Issue #278: hand the update to the coalescing writer task
+                // instead of doing synchronous disk I/O on this worker.
+                if persist.path.is_some() {
                     if let Some(latest) = cursors.get(&key) {
-                        let mut guard = lock(&persist.cursors);
-                        if guard.get(&key) != Some(latest) {
-                            guard.insert(key.clone(), latest.clone());
-                            if let Err(e) = write_cursor_file(path, &guard) {
-                                error!(
-                                    contract = %contract.label, error = %e,
-                                    "failed to persist cursor file; cursors may be replayed after a restart"
-                                );
+                        // Scope the lock so no guard is held across an await.
+                        let changed = {
+                            let mut guard = lock(&persist.cursors);
+                            if guard.get(&key) == Some(latest) {
+                                false
+                            } else {
+                                guard.insert(key.clone(), latest.clone());
+                                true
                             }
+                        };
+                        if changed {
+                            // Issue #281: snapshot cooldown and NoActivity state
+                            // alongside the cursor so it survives a restart.
+                            let cooldowns = lock(&persist.cooldowns)
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_default();
+                            let no_activity = state.no_activity_states.clone();
+                            persist.writer.send(persistence::StateUpdate {
+                                cursor_key: key.clone(),
+                                cursor: latest.clone(),
+                                cooldowns,
+                                no_activity,
+                            });
                         }
                     }
                 }
@@ -623,6 +675,17 @@ async fn poll_contract_forever(
                 }
             }
         }
+    }
+
+    // Issue #281: remember this contract's cooldown and NoActivity state for
+    // the next generation of tasks (e.g. after a config reload).
+    {
+        let mut guard = lock(&persist.cooldowns);
+        guard.insert(key.clone(), cooldowns.clone());
+    }
+    {
+        let mut guard = lock(&persist.no_activity);
+        guard.insert(key.clone(), state.no_activity_states.clone());
     }
 
     let cursor = cursors.remove(&key).unwrap_or_else(|| "now".to_string());
@@ -732,6 +795,12 @@ struct CursorPersistence {
     cursors: Arc<Mutex<HashMap<String, String>>>,
     /// `None` when `cursor_file` is not configured.
     path: Option<PathBuf>,
+    /// Issue #278: coalescing writer task that owns the fsync path.
+    writer: StateHandle,
+    /// Issue #281: persisted cooldown windows, keyed by cursor key.
+    cooldowns: Arc<Mutex<HashMap<String, CooldownTracker>>>,
+    /// Issue #281: persisted NoActivity states, keyed by cursor key.
+    no_activity: Arc<Mutex<HashMap<String, Vec<NoActivityState>>>>,
 }
 
 /// Lock a mutex, recovering the contents if a previous holder panicked.
@@ -743,27 +812,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// is written and fsynced, then renamed over the target, and the directory is
 /// fsynced so the rename itself survives a crash. An interrupted write
 /// therefore leaves the previous file intact rather than a truncated one.
+///
+/// Issue #278: this is synchronous and must only be called from a blocking
+/// context (see [`persistence::write_state_blocking`]).
 fn write_cursor_file(path: &Path, cursors: &HashMap<String, String>) -> Result<()> {
-    let raw = serde_json::to_string_pretty(cursors).context("failed to serialize cursors")?;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp)
-            .with_context(|| format!("failed to create cursor file '{}'", tmp.display()))?;
-        f.write_all(raw.as_bytes())
-            .with_context(|| format!("failed to write cursor file '{}'", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("failed to sync cursor file '{}'", tmp.display()))?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to replace cursor file '{}'", path.display()))?;
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        // Persist the rename itself. Failure here is not fatal: the data is
-        // already durable, only the directory entry may be lost on a crash.
-        if let Ok(handle) = fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
-    }
-    Ok(())
+    let doc = StateDocument::from_cursors(cursors.clone());
+    persistence::write_state_blocking(path, &doc)
 }
 
 fn build_poll_client(cfg: &AppConfig) -> Result<Client> {
@@ -800,44 +854,96 @@ impl CycleReport {
 /// `cfg.cursor_file` (if set) and return what happened. Used by
 /// `txwatch watch --once` for cron/CI/scheduler runs.
 pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
-    let client = build_poll_client(&cfg)?;
-    let mut cursors = load_cursors(&cfg);
-    let max_pages = cfg.effective_max_pages_per_cycle();
-    let mut report = CycleReport::default();
-    // A single cycle: cooldowns only dedupe within this run.
-    let mut cooldowns = CooldownTracker::new();
+    run_once_with_concurrency(cfg, dry_run, cfg.effective_concurrency()).await
+}
 
-    for contract in &cfg.contracts {
-        if !contract.enabled {
-            info!(contract = %contract.label, "contract is disabled — skipping");
-            continue;
-        }
+/// Like [`run_once`], but polls at most `concurrency` contracts at a time.
+///
+/// Issue #280: contracts are polled concurrently (bounded by `concurrency`)
+/// rather than one after another, so a cron run with many contracts and slow
+/// Horizon responses does not overrun its schedule.
+pub async fn run_once_with_concurrency(
+    cfg: AppConfig,
+    dry_run: bool,
+    concurrency: usize,
+) -> Result<CycleReport> {
+    let client = build_poll_client(&cfg)?;
+    // Issue #279: fail fast if another instance shares this cursor file.
+    let _state_lock = acquire_state_lock(cfg.cursor_file.as_deref())?;
+    // Issue #281: load cursors, cooldowns and NoActivity states so a cron run
+    // enforces cooldowns across runs and does not re-fire open incidents.
+    let loaded = load_state(&cfg);
+    let mut cursors = loaded.cursors;
+    let max_pages = cfg.effective_max_pages_per_cycle();
+    let concurrency = concurrency.max(1);
+
+    // Per-contract cooldown trackers and NoActivity states, seeded from the
+    // persisted document.
+    let mut cooldowns: HashMap<String, CooldownTracker> = loaded.cooldowns;
+    let mut no_activity: HashMap<String, Vec<NoActivityState>> = loaded.no_activity;
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut tasks = JoinSet::new();
+    for contract in cfg.contracts.iter().filter(|c| c.enabled).cloned() {
+        let client = client.clone();
+        let permit = Arc::clone(&semaphore);
+        let key = contract.cursor_key();
+        let cursor = cursors
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| "now".to_string());
+        let mut contract_cursors = HashMap::from([(key.clone(), cursor)]);
         let mut state = ContractPollState::default();
-        match poll_contract(
-            &client,
-            &HorizonSource::new(&client, poll_base_url(contract)),
-            contract,
-            &mut cursors,
-            &mut state,
-            &mut cooldowns,
-            max_pages,
-            dry_run,
-        )
-        .await
-        {
-            Ok((txs, alerts, webhook_failures, _skipped)) => {
-                report.transactions += txs;
-                report.alerts += alerts;
-                report.webhook_failures += webhook_failures;
+        state.no_activity_states = no_activity.remove(&key).unwrap_or_default();
+        let mut tracker = cooldowns.remove(&key).unwrap_or_default();
+        tasks.spawn(async move {
+            let _permit = permit.acquire_owned().await;
+            let result = poll_contract(
+                &client,
+                &HorizonSource::new(&client, poll_base_url(&contract)),
+                &contract,
+                &mut contract_cursors,
+                &mut state,
+                &mut tracker,
+                max_pages,
+                dry_run,
+            )
+            .await;
+            (key, contract, contract_cursors, state, tracker, result)
+        });
+    }
+
+    let mut report = CycleReport::default();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((key, contract, contract_cursors, state, tracker, result)) => {
+                if let Some(cursor) = contract_cursors.get(&key) {
+                    cursors.insert(key.clone(), cursor.clone());
+                }
+                cooldowns.insert(key.clone(), tracker);
+                no_activity.insert(key.clone(), state.no_activity_states);
+                match result {
+                    Ok((txs, alerts, webhook_failures, _skipped)) => {
+                        report.transactions += txs;
+                        report.alerts += alerts;
+                        report.webhook_failures += webhook_failures;
+                    }
+                    Err(e) => {
+                        log_poll_failure(&contract, 1, &e);
+                        report.poll_failures += 1;
+                    }
+                }
             }
             Err(e) => {
-                log_poll_failure(contract, 1, &e);
+                error!(error = ?e, "contract polling task panicked");
                 report.poll_failures += 1;
             }
         }
     }
 
-    save_cursors(&cfg, &cursors)?;
+    // Issue #281: persist cursors, cooldowns and NoActivity states together.
+    let doc = StateDocument::from_parts(cursors, cooldowns, no_activity);
+    save_state(&cfg, &doc)?;
     Ok(report)
 }
 

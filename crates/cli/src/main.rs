@@ -82,6 +82,10 @@ enum Command {
         /// Run a single poll cycle, deliver alerts, save cursors and exit
         #[arg(long)]
         once: bool,
+
+        /// Maximum number of contracts polled concurrently
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -528,20 +532,23 @@ async fn main() -> Result<()> {
         Command::Watch {
             dry_run,
             once,
+            concurrency,
             #[cfg(feature = "metrics")]
             metrics_addr,
         } => {
             let config_path = required_config(&cli.config)?;
             let cfg = load_config(&cli)?;
+            let concurrency = concurrency.max(1);
 
             if once {
                 info!(
                     version = VERSION,
                     contracts = cfg.contracts.len(),
                     dry_run,
+                    concurrency,
                     "running a single TxWatch poll cycle"
                 );
-                let report = txwatch_poller::run_once(cfg, dry_run).await?;
+                let report = txwatch_poller::run_once(cfg, dry_run, concurrency).await?;
                 info!(
                     transactions = report.transactions,
                     alerts = report.alerts,
@@ -583,9 +590,11 @@ async fn main() -> Result<()> {
                 contracts = cfg.contracts.len(),
                 interval_secs = cfg.poll_interval_seconds,
                 dry_run = dry_run,
+                concurrency,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_reload(cfg, dry_run, shutdown_rx, reload_rx).await?;
+            txwatch_poller::run_with_reload(cfg, dry_run, concurrency, shutdown_rx, reload_rx)
+                .await?;
         }
     }
 

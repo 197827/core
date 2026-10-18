@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use txwatch_config::AppConfig;
 use wiremock::matchers::{method, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -63,10 +63,28 @@ async fn requested_cursors(server: &MockServer) -> Vec<String> {
 fn cursor_file(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("txwatch-{}-{}.json", std::process::id(), name));
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(lock_path(&path));
     path
 }
 
+fn lock_path(cursor_file: &Path) -> PathBuf {
+    let mut name = cursor_file.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Reads the persisted state document, returning its cursor map.
 fn read_cursors(path: &Path) -> HashMap<String, String> {
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let cursors = doc
+        .get("cursors")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    serde_json::from_value(cursors).unwrap()
+}
+
+/// Reads the whole persisted state document.
+fn read_state(path: &Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -231,4 +249,123 @@ async fn ambiguous_legacy_cursor_starts_from_now_on_every_network() {
 
     assert_eq!(requested_cursors(&testnet).await, vec!["now"]);
     assert_eq!(requested_cursors(&futurenet).await, vec!["now"]);
+}
+
+#[tokio::test]
+async fn legacy_cursor_file_is_migrated_to_a_versioned_state_document() {
+    let server = MockServer::start().await;
+    serve_page(&server, "500", tx_page(501..=501)).await;
+    let file = cursor_file("legacy-versioned");
+    std::fs::write(&file, json!({ ID: "500" }).to_string()).unwrap();
+
+    txwatch_poller::run_once(
+        config(&contract_toml("legacy", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let state = read_state(&file);
+    assert_eq!(state.get("version").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        state
+            .get("cursors")
+            .and_then(|c| c.get(format!("testnet:{ID}")))
+            .and_then(Value::as_str),
+        Some("501")
+    );
+}
+
+#[tokio::test]
+async fn runtime_state_round_trips_across_runs() {
+    let server = MockServer::start().await;
+    serve_page(&server, "now", empty_page()).await;
+    let file = cursor_file("state-roundtrip");
+    let key = format!("testnet:{ID}");
+    std::fs::write(
+        &file,
+        json!({
+            "version": 1,
+            "cursors": { key.clone(): "777" },
+            "cooldowns": { "capped": 1_700_000_000u64 },
+            "no_activity": { "capped": { "alerting": true } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    txwatch_poller::run_once(
+        config(&contract_toml("capped", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let state = read_state(&file);
+    assert_eq!(state.get("version").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        state
+            .get("cooldowns")
+            .and_then(|c| c.get("capped"))
+            .and_then(Value::as_u64),
+        Some(1_700_000_000)
+    );
+    assert_eq!(
+        state
+            .get("no_activity")
+            .and_then(|n| n.get("capped"))
+            .and_then(|n| n.get("alerting"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn cursor_file_ending_in_tmp_does_not_clobber_itself() {
+    let server = MockServer::start().await;
+    serve_page(&server, "now", empty_page()).await;
+    let file = std::env::temp_dir().join(format!(
+        "txwatch-{}-ends-in-tmp.tmp",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(lock_path(&file));
+
+    txwatch_poller::run_once(
+        config(&contract_toml("tmp", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await
+    .unwrap();
+
+    assert!(file.exists(), "cursor file must survive the write");
+    let state = read_state(&file);
+    assert_eq!(state.get("version").and_then(Value::as_u64), Some(1));
+}
+
+#[tokio::test]
+async fn held_lock_makes_a_second_instance_fail_fast() {
+    let server = MockServer::start().await;
+    serve_page(&server, "now", empty_page()).await;
+    let file = cursor_file("lock-contention");
+    let lock = lock_path(&file);
+    std::fs::write(&lock, b"").unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&held).unwrap();
+
+    let result = txwatch_poller::run_once(
+        config(&contract_toml("locked", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await;
+
+    assert!(result.is_err(), "second instance must fail while lock is held");
+    assert!(requested_cursors(&server).await.is_empty());
+
+    fs2::FileExt::unlock(&held).unwrap();
+    drop(held);
+    let _ = std::fs::remove_file(&lock);
 }
