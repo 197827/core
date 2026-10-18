@@ -1467,6 +1467,10 @@ async fn deliver_payload(
         warn!(contract = %contract.label, "no webhook destination configured — dropping alert");
         return;
     }
+    let destinations: Vec<WebhookDestination> = destinations
+        .into_iter()
+        .filter(|d| d.accepts(payload.severity.as_deref(), &payload.rule_type))
+        .collect();
 
     *webhook_failures += deliver_to_all(client, contract, &destinations, payload).await;
 }
