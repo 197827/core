@@ -187,3 +187,117 @@ fn test_pagerduty_resolve_snapshot() {
 
     insta::assert_snapshot!(body);
 }
+
+/// A rule configured with `severity = "info"` must page as `info` even when
+/// its `rule_type` (e.g. `AdminFunctionCalled`) would otherwise be treated as
+/// critical by the rule-type heuristic.
+#[test]
+fn test_pagerduty_severity_overrides_rule_type_heuristic() {
+    let mut payload = test_payload("AdminFunctionCalled");
+    payload.severity = Some("info".to_string());
+
+    let body = txwatch_notifier::format::pagerduty(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        value["payload"]["severity"], "info",
+        "configured severity must take precedence over rule_type heuristic"
+    );
+}
+
+/// A `critical` `LargeTransfer` must page as `critical`, not the `warning`
+/// the rule-type heuristic would otherwise assign.
+#[test]
+fn test_pagerduty_critical_large_transfer() {
+    let mut payload = test_payload("LargeTransfer");
+    payload.severity = Some("critical".to_string());
+
+    let body = txwatch_notifier::format::pagerduty(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(value["payload"]["severity"], "critical");
+}
+
+/// When severity is unset, the rule-type heuristic must still apply.
+#[test]
+fn test_pagerduty_severity_falls_back_to_rule_type() {
+    let mut payload = test_payload("AdminFunctionCalled");
+    payload.severity = None;
+
+    let body = txwatch_notifier::format::pagerduty(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        value["payload"]["severity"], "critical",
+        "unset severity must fall back to the rule_type heuristic"
+    );
+}
+
+/// Discord colour must follow the configured severity: a `critical`
+/// `LargeTransfer` renders red, not the warning/blue the heuristic would pick.
+#[test]
+fn test_discord_color_uses_configured_severity() {
+    let mut payload = test_payload("LargeTransfer");
+    payload.severity = Some("critical".to_string());
+
+    let body = txwatch_notifier::format::discord(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        value["embeds"][0]["color"], 0xE0_1B_24,
+        "critical severity must render the critical (red) colour"
+    );
+}
+
+/// Discord colour must fall back to the rule-type heuristic when severity is
+/// unset.
+#[test]
+fn test_discord_color_falls_back_to_rule_type() {
+    let mut payload = test_payload("LargeTransfer");
+    payload.severity = None;
+
+    let body = txwatch_notifier::format::discord(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        value["embeds"][0]["color"], 0xF0_B4_00,
+        "unset severity must fall back to the rule_type heuristic (warning)"
+    );
+}
+
+/// Slack output must reflect the configured severity rather than the
+/// rule-type heuristic.
+#[test]
+fn test_slack_uses_configured_severity() {
+    let mut payload = test_payload("AdminFunctionCalled");
+    payload.severity = Some("info".to_string());
+
+    let body = txwatch_notifier::format::slack(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    let text = value["attachments"][0]["color"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(
+        text, "#36a64f",
+        "info severity must render the info (green) colour in Slack"
+    );
+}
+
+/// Slack must fall back to the rule-type heuristic when severity is unset.
+#[test]
+fn test_slack_falls_back_to_rule_type() {
+    let mut payload = test_payload("AdminFunctionCalled");
+    payload.severity = None;
+
+    let body = txwatch_notifier::format::slack(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    let text = value["attachments"][0]["color"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(
+        text, "#e01e5a",
+        "unset severity must fall back to the rule_type heuristic (critical)"
+    );
+}

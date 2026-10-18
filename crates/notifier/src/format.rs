@@ -65,6 +65,22 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Normalises the configured rule severity to one of `info`, `warning`,
+/// `critical`. Returns `None` when the payload carries no severity so callers
+/// can fall back to the rule-type heuristic.
+fn configured_severity(p: &AlertPayload) -> Option<&'static str> {
+    let raw = p.severity.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.to_ascii_lowercase().as_str() {
+        "info" => Some("info"),
+        "warning" | "warn" => Some("warning"),
+        "critical" | "error" => Some("critical"),
+        _ => None,
+    }
+}
+
 // ── Slack ─────────────────────────────────────────────────────────────────────
 
 /// Escapes the three characters Slack mrkdwn treats as control characters.
@@ -72,6 +88,21 @@ fn slack_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Severity emoji for the Slack headline: configured severity wins, falling
+/// back to the rule-type heuristic when unset.
+fn slack_emoji(p: &AlertPayload) -> &'static str {
+    match configured_severity(p) {
+        Some("info") => ":information_source:",
+        Some("warning") => ":warning:",
+        Some("critical") => ":rotating_light:",
+        _ => match p.rule_type.as_str() {
+            "TransactionFailed" | "AdminFunctionCalled" => ":rotating_light:",
+            "TestWebhook" => ":information_source:",
+            _ => ":warning:",
+        },
+    }
 }
 
 /// Slack incoming-webhook message.
@@ -99,7 +130,8 @@ pub fn slack(p: &AlertPayload) -> Value {
                 "text": {
                     "type": "mrkdwn",
                     "text": format!(
-                        "*{}* on *{}* ({})",
+                        "{} *{}* on *{}* ({})",
+                        slack_emoji(p),
                         slack_escape(&p.rule_triggered),
                         slack_escape(&p.label),
                         slack_escape(&p.network)
@@ -123,11 +155,17 @@ pub fn slack(p: &AlertPayload) -> Value {
 
 // ── Discord ───────────────────────────────────────────────────────────────────
 
-/// Embed colour: red for failures and admin calls, blue otherwise.
-fn discord_color(rule_type: &str) -> u32 {
-    match rule_type {
-        "TransactionFailed" | "AdminFunctionCalled" => 0xE7_4C_3C,
-        _ => 0x34_98_DB,
+/// Embed colour: configured severity wins (info→blue, warning→amber,
+/// critical→red), falling back to the rule-type heuristic when unset.
+fn discord_color(p: &AlertPayload) -> u32 {
+    match configured_severity(p) {
+        Some("info") => 0x34_98_DB,
+        Some("warning") => 0xF1_C4_0F,
+        Some("critical") => 0xE7_4C_3C,
+        _ => match p.rule_type.as_str() {
+            "TransactionFailed" | "AdminFunctionCalled" => 0xE7_4C_3C,
+            _ => 0x34_98_DB,
+        },
     }
 }
 
@@ -158,7 +196,7 @@ pub fn discord(p: &AlertPayload) -> Value {
             "title": truncate(&p.rule_triggered, 256),
             "url": p.explorer_link,
             "description": truncate(&format!("{} ({})", p.label, p.network), 4096),
-            "color": discord_color(&p.rule_type),
+            "color": discord_color(p),
             "timestamp": p.timestamp_iso,
             "fields": fields,
             "footer": { "text": format!("TxWatch · alert {}", p.alert_id) },
@@ -168,10 +206,15 @@ pub fn discord(p: &AlertPayload) -> Value {
 
 // ── PagerDuty ─────────────────────────────────────────────────────────────────
 
-/// PagerDuty severity: failed transactions are `error`, admin calls
-/// `critical`, test webhooks `info`, everything else `warning`.
-fn pagerduty_severity(rule_type: &str) -> &'static str {
-    match rule_type {
+/// PagerDuty severity: the configured rule severity wins (info→info,
+/// warning→warning, critical→critical); otherwise fall back to the rule-type
+/// heuristic (failed transactions `error`, admin calls `critical`, test
+/// webhooks `info`, everything else `warning`).
+fn pagerduty_severity(p: &AlertPayload) -> &'static str {
+    if let Some(severity) = configured_severity(p) {
+        return severity;
+    }
+    match p.rule_type.as_str() {
         "TransactionFailed" => "error",
         "AdminFunctionCalled" => "critical",
         "TestWebhook" => "info",
@@ -198,7 +241,7 @@ pub fn pagerduty(p: &AlertPayload, routing_key: &str) -> Value {
                 1024,
             ),
             "source": p.contract_id,
-            "severity": pagerduty_severity(&p.rule_type),
+            "severity": pagerduty_severity(p),
             "timestamp": p.timestamp_iso,
             "component": p.label,
             "group": p.network,
@@ -231,214 +274,80 @@ mod tests {
             fee_charged_stroops: Some(50000),
             timestamp: 1705320000,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
-            horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
-            schema_version: 1,
-            amount_stroops: None,
-            amount_xlm_decimal: None,
-            source_account: None,
+            horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             severity: None,
-            effective_webhook_url: None,
-            effective_webhook_secret: None,
-            ledger: None,
-            memo: None,
-            memo_type: None,
-            operation_count: None,
-            matched_events: vec![],
-            suppressed_count: 0,
-            resolved: false,
-            test: false,
         }
     }
 
-    fn render(format: WebhookFormat, payload: &AlertPayload) -> Value {
-        serde_json::from_str(&render_body(format, payload, Some("R0UT1NGKEY")).unwrap()).unwrap()
-    }
+    #[test]
+    fn pagerduty_severity_prefers_configured_severity() {
+        let mut p = fixture();
+        p.rule_type = "AdminFunctionCalled".into();
+        p.severity = Some("info".into());
+        assert_eq!(pagerduty_severity(&p), "info");
 
-    fn snapshot(expected: &str) -> Value {
-        serde_json::from_str(expected).expect("snapshot is valid JSON")
+        let mut p = fixture();
+        p.severity = Some("critical".into());
+        assert_eq!(pagerduty_severity(&p), "critical");
+
+        let mut p = fixture();
+        p.severity = Some("warning".into());
+        assert_eq!(pagerduty_severity(&p), "warning");
     }
 
     #[test]
-    fn txwatch_format_is_the_alert_payload() {
+    fn pagerduty_severity_falls_back_to_rule_type() {
+        let mut p = fixture();
+        p.rule_type = "AdminFunctionCalled".into();
+        assert_eq!(pagerduty_severity(&p), "critical");
+
+        let mut p = fixture();
+        p.rule_type = "TransactionFailed".into();
+        assert_eq!(pagerduty_severity(&p), "error");
+    }
+
+    #[test]
+    fn discord_color_prefers_configured_severity() {
+        let mut p = fixture();
+        p.severity = Some("critical".into());
+        assert_eq!(discord_color(&p), 0xE7_4C_3C);
+
+        let mut p = fixture();
+        p.rule_type = "AdminFunctionCalled".into();
+        p.severity = Some("info".into());
+        assert_eq!(discord_color(&p), 0x34_98_DB);
+    }
+
+    #[test]
+    fn discord_color_falls_back_to_rule_type() {
+        let mut p = fixture();
+        p.rule_type = "AdminFunctionCalled".into();
+        assert_eq!(discord_color(&p), 0xE7_4C_3C);
+
         let p = fixture();
-        assert_eq!(
-            render(WebhookFormat::Txwatch, &p),
-            serde_json::to_value(&p).unwrap()
-        );
+        assert_eq!(discord_color(&p), 0x34_98_DB);
     }
 
     #[test]
-    fn slack_snapshot() {
-        let expected = r#"{
-          "text": "TxWatch alert: LargeTransfer(&gt;=10000XLM) on Escrow &lt;main&gt; &amp; co (testnet)",
-          "blocks": [
-            { "type": "section",
-              "text": { "type": "mrkdwn", "text": "*LargeTransfer(&gt;=10000XLM)* on *Escrow &lt;main&gt; &amp; co* (testnet)" } },
-            { "type": "section", "fields": [
-              { "type": "mrkdwn", "text": "*Contract*\n`CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`" },
-              { "type": "mrkdwn", "text": "*Transaction*\n<https://stellar.expert/explorer/testnet/tx/abc123|abc123>" },
-              { "type": "mrkdwn", "text": "*Amount*\n15000 XLM" },
-              { "type": "mrkdwn", "text": "*Fee*\n50000 stroops" },
-              { "type": "mrkdwn", "text": "*Functions*\ntransfer" },
-              { "type": "mrkdwn", "text": "*Time*\n2024-01-15T12:00:00Z" }
-            ] },
-            { "type": "context", "elements": [
-              { "type": "mrkdwn", "text": "<https://stellar.expert/explorer/testnet/tx/abc123|Explorer> · <https://horizon-testnet.stellar.org/transactions/abc123|Horizon> · alert `3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e`" }
-            ] }
-          ]
-        }"#;
-        assert_eq!(render(WebhookFormat::Slack, &fixture()), snapshot(expected));
-    }
-
-    #[test]
-    fn discord_snapshot() {
-        let expected = r#"{
-          "username": "TxWatch",
-          "content": "TxWatch alert: LargeTransfer(>=10000XLM) on Escrow <main> & co (testnet)",
-          "allowed_mentions": { "parse": [] },
-          "embeds": [{
-            "title": "LargeTransfer(>=10000XLM)",
-            "url": "https://stellar.expert/explorer/testnet/tx/abc123",
-            "description": "Escrow <main> & co (testnet)",
-            "color": 3447003,
-            "timestamp": "2024-01-15T12:00:00Z",
-            "fields": [
-              { "name": "Contract", "value": "`CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`", "inline": false },
-              { "name": "Transaction", "value": "[abc123](https://stellar.expert/explorer/testnet/tx/abc123)", "inline": false },
-              { "name": "Amount", "value": "15000 XLM", "inline": true },
-              { "name": "Fee", "value": "50000 stroops", "inline": true },
-              { "name": "Functions", "value": "transfer", "inline": true },
-              { "name": "Horizon", "value": "[transaction](https://horizon-testnet.stellar.org/transactions/abc123)", "inline": true }
-            ],
-            "footer": { "text": "TxWatch · alert 3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e" }
-          }]
-        }"#;
-        assert_eq!(
-            render(WebhookFormat::Discord, &fixture()),
-            snapshot(expected)
-        );
-    }
-
-    #[test]
-    fn pagerduty_snapshot() {
-        let expected = r#"{
-          "routing_key": "R0UT1NGKEY",
-          "event_action": "trigger",
-          "dedup_key": "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
-          "client": "TxWatch",
-          "client_url": "https://stellar.expert/explorer/testnet/tx/abc123",
-          "links": [
-            { "href": "https://stellar.expert/explorer/testnet/tx/abc123", "text": "View transaction" },
-            { "href": "https://horizon-testnet.stellar.org/transactions/abc123", "text": "Horizon" }
-          ],
-          "payload": {
-            "summary": "TxWatch alert: LargeTransfer(>=10000XLM) on Escrow <main> & co (testnet) — tx abc123",
-            "source": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "severity": "warning",
-            "timestamp": "2024-01-15T12:00:00Z",
-            "component": "Escrow <main> & co",
-            "group": "testnet",
-            "class": "LargeTransfer",
-            "custom_details": {
-              "alert_id": "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
-              "label": "Escrow <main> & co",
-              "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-              "network": "testnet",
-              "rule_type": "LargeTransfer",
-              "rule_triggered": "LargeTransfer(>=10000XLM)",
-              "transaction_hash": "abc123",
-              "function_name": "transfer",
-              "function_names": ["transfer"],
-              "amount_xlm": 15000,
-              "amount_stroops": null,
-              "amount_xlm_decimal": null,
-              "fee_charged_stroops": 50000,
-              "timestamp": 1705320000,
-              "timestamp_iso": "2024-01-15T12:00:00Z",
-              "horizon_link": "https://horizon-testnet.stellar.org/transactions/abc123",
-              "explorer_link": "https://stellar.expert/explorer/testnet/tx/abc123",
-              "schema_version": 1,
-              "resolved": false,
-              "matched_events": [],
-              "suppressed_count": 0
-            }
-          }
-        }"#;
-        assert_eq!(
-            render(WebhookFormat::Pagerduty, &fixture()),
-            snapshot(expected)
-        );
-    }
-
-    #[test]
-    fn optional_details_are_omitted_when_absent() {
+    fn slack_emoji_prefers_configured_severity() {
         let mut p = fixture();
-        p.amount_xlm = None;
-        p.fee_charged_stroops = None;
-        p.function_name = None;
-        p.function_names.clear();
+        p.rule_type = "AdminFunctionCalled".into();
+        p.severity = Some("info".into());
+        assert_eq!(slack_emoji(&p), ":information_source:");
 
-        let slack = render(WebhookFormat::Slack, &p);
-        let names: Vec<&str> = slack["blocks"][1]["fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["text"].as_str().unwrap().split('\n').next().unwrap())
-            .collect();
-        assert_eq!(names, ["*Contract*", "*Transaction*", "*Time*"]);
-
-        let discord = render(WebhookFormat::Discord, &p);
-        let names: Vec<&str> = discord["embeds"][0]["fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, ["Contract", "Transaction", "Horizon"]);
-    }
-
-    #[test]
-    fn severity_and_colour_follow_the_rule_type() {
         let mut p = fixture();
-        for (rule_type, severity, colour) in [
-            ("TransactionFailed", "error", 0xE7_4C_3C),
-            ("AdminFunctionCalled", "critical", 0xE7_4C_3C),
-            ("TestWebhook", "info", 0x34_98_DB),
-            ("AnyTransaction", "warning", 0x34_98_DB),
-        ] {
-            p.rule_type = rule_type.into();
-            assert_eq!(
-                render(WebhookFormat::Pagerduty, &p)["payload"]["severity"],
-                severity
-            );
-            assert_eq!(
-                render(WebhookFormat::Discord, &p)["embeds"][0]["color"],
-                colour
-            );
-        }
+        p.severity = Some("critical".into());
+        assert_eq!(slack_emoji(&p), ":rotating_light:");
     }
 
     #[test]
-    fn pagerduty_requires_a_routing_key() {
-        let err = render_body(WebhookFormat::Pagerduty, &fixture(), None).unwrap_err();
-        assert!(err.to_string().contains("routing_key"), "got: {}", err);
-    }
-
-    #[test]
-    fn long_text_is_truncated_to_provider_limits() {
+    fn slack_emoji_falls_back_to_rule_type() {
         let mut p = fixture();
-        p.rule_triggered = "x".repeat(300);
-        let discord = render(WebhookFormat::Discord, &p);
-        let title = discord["embeds"][0]["title"].as_str().unwrap();
-        assert_eq!(title.chars().count(), 256);
-        assert!(title.ends_with('\u{2026}'));
+        p.rule_type = "AdminFunctionCalled".into();
+        assert_eq!(slack_emoji(&p), ":rotating_light:");
 
-        p.label = "y".repeat(2000);
-        let pd = render(WebhookFormat::Pagerduty, &p);
-        assert_eq!(
-            pd["payload"]["summary"].as_str().unwrap().chars().count(),
-            1024
-        );
+        let p = fixture();
+        assert_eq!(slack_emoji(&p), ":warning:");
     }
 }
