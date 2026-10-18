@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, EVENT_TOPIC_WILDCARD};
@@ -86,26 +87,137 @@ pub struct ContractEvent {
     pub data: Value,
 }
 
-impl ContractEvent {
-    /// The first topic as a symbol, if it is one.
-    fn first_symbol(&self) -> Option<&str> {
-        self.topics.first()?.get("symbol")?.as_str()
+/// A single `data` matcher for an `EventEmitted` rule (issue #262).
+///
+/// `pointer` is an RFC 6901 JSON pointer into the event's decoded `data`
+/// (e.g. `"/amount"` or `""` for the whole value). `op` selects the
+/// comparison and `value` is the expected value as a string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataMatcher {
+    /// JSON pointer into the event data (`""` addresses the whole value).
+    pub pointer: String,
+    /// Comparison operator: `"eq"`, `"gte"` or `"lte"`.
+    pub op: String,
+    /// Expected value, rendered as text.
+    pub value: String,
+}
+
+impl DataMatcher {
+    /// Does `data` satisfy this matcher?
+    pub fn matches(&self, data: &Value) -> bool {
+        let Some(target) = resolve_pointer(data, &self.pointer) else {
+            return false;
+        };
+        compare_scval(target, &self.op, &self.value)
+    }
+}
+
+/// Resolve an RFC 6901 JSON pointer against `value`. An empty pointer returns
+/// the whole value. Returns `None` when any segment is missing.
+fn resolve_pointer<'v>(value: &'v Value, pointer: &str) -> Option<&'v Value> {
+    if pointer.is_empty() {
+        return Some(value);
+    }
+    let mut current = value;
+    for raw in pointer.trim_start_matches('/').split('/') {
+        // Unescape RFC 6901: `~1` → `/`, `~0` → `~`.
+        let segment = raw.replace("~1", "/").replace("~0", "~");
+        current = match current {
+            Value::Object(map) => map.get(&segment)?,
+            Value::Array(arr) => arr.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Extract the inner scalar text of an `ScVal` JSON value, if it is one.
+fn scval_inner_text(value: &Value) -> Option<String> {
+    let scalar = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    };
+    match value {
+        Value::Object(map) if map.len() == 1 => map.values().next().and_then(scalar),
+        other => scalar(other),
+    }
+}
+
+/// Compare an `ScVal` JSON value against `expected` using `op`.
+///
+/// i128/u128 values (either bare numeric strings or `{"i128": "…"}` /
+/// `{"u128": "…"}` wrappers) are compared as 128-bit integers; everything
+/// else falls back to string comparison.
+fn compare_scval(value: &Value, op: &str, expected: &str) -> bool {
+    // Detect a 128-bit integer ScVal and compare numerically.
+    let int_text = match value {
+        Value::Object(map) if map.len() == 1 => {
+            let (k, v) = map.iter().next()?;
+            if (k == "i128" || k == "u128") && v.is_string() {
+                v.as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(text) = int_text {
+        if let (Ok(lhs), Ok(rhs)) = (text.parse::<i128>(), expected.parse::<i128>()) {
+            return match op {
+                "eq" => lhs == rhs,
+                "gte" => lhs >= rhs,
+                "lte" => lhs <= rhs,
+                _ => false,
+            };
+        }
+        // Fall through to string comparison if parsing fails.
     }
 
-    /// Does this event match an `EventEmitted { topic, topics }` rule?
-    /// `topic` must equal topic 0 as a symbol exactly; each entry of `topics`
-    /// is compared positionally against topics 1.. (`"*"` matches anything).
-    pub fn matches(&self, topic: &str, topics: &[String]) -> bool {
-        if self.first_symbol() != Some(topic) {
+    let Some(actual) = scval_inner_text(value) else {
+        // Non-scalar: compare compact JSON for `eq` only.
+        return op == "eq" && value.to_string() == expected;
+    };
+    match op {
+        "eq" => actual == expected,
+        "gte" => compare_ordered(&actual, expected) != Ordering::Less,
+        "lte" => compare_ordered(&actual, expected) != Ordering::Greater,
+        _ => false,
+    }
+}
+
+/// Order two strings numerically when both parse as integers, else lexically.
+fn compare_ordered(a: &str, b: &str) -> Ordering {
+    if let (Ok(x), Ok(y)) = (a.parse::<i128>(), b.parse::<i128>()) {
+        x.cmp(&y)
+    } else {
+        a.cmp(b)
+    }
+}
+
+impl ContractEvent {
+    /// Does this event match an `EventEmitted { topic, topics, data }` rule?
+    ///
+    /// `topic` is compared against topic 0 (any scalar `ScVal`, optionally
+    /// typed with a `type:` prefix such as `address:G…` or `u32:5`). Each
+    /// entry of `topics` is compared positionally against topics 1..
+    /// (`"*"` matches anything). Every `data` matcher must also match.
+    pub fn matches(&self, topic: &str, topics: &[String], data: &[DataMatcher]) -> bool {
+        let Some(first) = self.topics.first() else {
+            return false;
+        };
+        if !topic_value_matches(first, topic) {
             return false;
         }
-        topics.iter().enumerate().all(|(i, pattern)| {
+        let topics_ok = topics.iter().enumerate().all(|(i, pattern)| {
             pattern == EVENT_TOPIC_WILDCARD
                 || self
                     .topics
                     .get(i + 1)
                     .is_some_and(|value| topic_value_matches(value, pattern))
-        })
+        });
+        topics_ok && data.iter().all(|m| m.matches(&self.data))
     }
 }
 
@@ -116,21 +228,28 @@ fn cmp_rendered(value: &Value, pattern: &str) -> bool {
     value.to_string() == pattern
 }
 
-// Compare one `ScVal` topic against a config pattern. Single-key scalar
-/// values (`{"symbol": "x"}`, `{"address": "G…"}`, `{"u32": 5}`, `{"i128": "-1"}`)
-/// match the inner value's text; anything else matches its compact JSON.
+// Compare one `ScVal` topic against a config pattern (issue #263).
+//
+// A pattern may be typed with a `type:` prefix (`address:`, `u32:`, `i128:`,
+// `symbol:`, `string:`, `bytes:`, `bool:`, …) to constrain the ScVal variant,
+// or bare to match any scalar's inner text. Non-scalar topics match their
+// compact JSON rendering.
 fn topic_value_matches(value: &Value, pattern: &str) -> bool {
-    let scalar = |v: &Value| match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    };
-    let inner = match value {
-        Value::Object(map) if map.len() == 1 => map.values().next().and_then(scalar),
-        other => scalar(other),
-    };
-    match inner {
+    // Typed pattern: `type:rest`.
+    if let Some((ty, rest)) = pattern.split_once(':') {
+        if let Value::Object(map) = value {
+            if map.len() == 1 {
+                let (k, v) = map.iter().next().unwrap_or((&String::new(), &Value::Null));
+                if k == ty {
+                    return scval_inner_text(v).is_some_and(|text| text == rest);
+                }
+                return false;
+            }
+        }
+        // Typed pattern against a bare scalar: compare inner text.
+        return scval_inner_text(value).is_some_and(|text| text == rest);
+    }
+    match scval_inner_text(value) {
         Some(text) => text == pattern,
         // A non-scalar topic matches its own compact JSON rendering.
         None => cmp_rendered(value, pattern),
@@ -172,9 +291,40 @@ pub struct EnrichedTransaction {
     pub memo_type: Option<String>,
     /// Total number of operations in the transaction.
     pub operation_count: Option<u32>,
+    /// The contract this transaction is being evaluated for. Used by
+    /// `LargeTransfer` (issue #264) and `ContractUpgraded` (issue #265).
+    pub watched_contract_id: String,
     /// Contract events emitted by this transaction. Only populated when the
     /// contract has an `EventEmitted` rule (fetched from Soroban RPC).
     pub events: Vec<ContractEvent>,
+    /// Per-contract native balance changes observed in this transaction
+    /// (issue #264). Used by `LargeTransfer` so unrelated transfers in the
+    /// same transaction do not count toward the watched contract.
+    pub contract_transfers: Vec<ContractTransfer>,
+    /// Executable (WASM) change for the watched contract, if any (issue #265).
+    pub wasm_upgrade: Option<WasmUpgrade>,
+}
+
+/// A native (XLM) balance movement between two addresses in a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractTransfer {
+    /// Address the funds moved from (may be empty for mints).
+    pub from: String,
+    /// Address the funds moved to (may be empty for burns).
+    pub to: String,
+    /// Amount moved, in stroops.
+    pub amount_stroops: u64,
+}
+
+/// A change to a contract's executable (WASM) code (issue #265).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmUpgrade {
+    /// Contract whose code changed.
+    pub contract_id: String,
+    /// Previous WASM hash (hex), if known.
+    pub old_wasm_hash: Option<String>,
+    /// New WASM hash (hex).
+    pub new_wasm_hash: Option<String>,
     /// `true` when the operations fetch failed, so `function_names` and
     /// `amount_stroops` may be incomplete. Alerts that still fire carry this
     /// flag so receivers know the evaluation was degraded.
@@ -222,7 +372,51 @@ impl EnrichedTransaction {
             memo: tx.memo,
             memo_type: tx.memo_type,
             operation_count: tx.operation_count,
+            watched_contract_id: String::new(),
             events: Vec::new(),
+            contract_transfers: Vec::new(),
+            wasm_upgrade: None,
+        })
+    }
+
+    /// Set the contract this transaction is being evaluated for.
+    pub fn with_watched_contract(mut self, contract_id: impl Into<String>) -> Self {
+        self.watched_contract_id = contract_id.into();
+        self
+    }
+
+    /// Attach per-contract balance changes observed in this transaction.
+    pub fn with_contract_transfers(mut self, transfers: Vec<ContractTransfer>) -> Self {
+        self.contract_transfers = transfers;
+        self
+    }
+
+    /// Attach an executable (WASM) change for the watched contract.
+    pub fn with_wasm_upgrade(mut self, upgrade: Option<WasmUpgrade>) -> Self {
+        self.wasm_upgrade = upgrade;
+        self
+    }
+
+    /// Sum the stroops moved into or out of `contract_id` in this transaction,
+    /// filtered by `direction` (`"in"`, `"out"` or `"any"`). Returns `None`
+    /// when no matching transfer exists (issue #264).
+    pub fn contract_amount_stroops(&self, contract_id: &str, direction: &str) -> Option<u64> {
+        let mut total: u64 = 0;
+        let mut matched = false;
+        for t in &self.contract_transfers {
+            let counts = match direction {
+                "in" => t.to == contract_id,
+                "out" => t.from == contract_id,
+                _ => t.from == contract_id || t.to == contract_id,
+            };
+            if counts {
+                matched = true;
+                total = total.saturating_add(t.amount_stroops);
+            }
+        }
+        matched.then_some(total)
+    }
+
             enrichment_incomplete: false,
         })
     }
@@ -332,6 +526,12 @@ pub struct AlertPayload {
     /// omitted from the JSON otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub test: bool,
+    /// Previous WASM hash for a `ContractUpgraded` alert (issue #265).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_wasm_hash: Option<String>,
+    /// New WASM hash for a `ContractUpgraded` alert (issue #265).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_wasm_hash: Option<String>,
     /// `true` when the transaction's operations could not be fetched, so
     /// `function_names` / `amount_stroops` may be incomplete and rules such as
     /// `FunctionCalled`, `AdminFunctionCalled` and `LargeTransfer` may have
@@ -537,6 +737,8 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                     matched_events: matched_events(rule, tx),
                     suppressed_count: 0,
                     test: false,
+                    old_wasm_hash: upgrade_hashes(rule, tx).and_then(|(o, _)| o),
+                    new_wasm_hash: upgrade_hashes(rule, tx).and_then(|(_, n)| n),
                     enrichment_incomplete: tx.enrichment_incomplete,
                 }),
                 Ok(false) => None,
@@ -625,10 +827,14 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         // #43: threshold_stroops is pre-computed once during validation; no
         // per-evaluation multiplication or overflow path needed.
+        // #264: only count balance changes involving the watched contract,
+        // filtered by direction, rather than every transfer in the transaction.
         AlertRule::LargeTransfer {
-            threshold_stroops, ..
+            threshold_stroops,
+            direction,
+            ..
         } => tx
-            .amount_stroops
+            .contract_amount_stroops(&tx.watched_contract_id, direction)
             .map(|s| s >= *threshold_stroops)
             .unwrap_or(false),
 
@@ -701,19 +907,46 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         // NoActivity is a poll-cycle-level rule evaluated by `check_no_activity`,
         // not a per-transaction rule.  It never fires here.
         AlertRule::NoActivity { .. } => false,
-        AlertRule::EventEmitted { topic, topics } => {
-            tx.events.iter().any(|e| e.matches(topic, topics))
-        }
+        AlertRule::EventEmitted {
+            topic,
+            topics,
+            data,
+        } => tx.events.iter().any(|e| e.matches(topic, topics, data)),
+
+        // #265: fire when the watched contract's executable changed.
+        AlertRule::ContractUpgraded => tx
+            .wasm_upgrade
+            .as_ref()
+            .is_some_and(|u| u.contract_id == tx.watched_contract_id),
     })
+}
+
+/// The (old, new) WASM hashes for a `ContractUpgraded` rule that fired.
+fn upgrade_hashes(
+    rule: &AlertRule,
+    tx: &EnrichedTransaction,
+) -> Option<(Option<String>, Option<String>)> {
+    match rule {
+        AlertRule::ContractUpgraded => tx
+            .wasm_upgrade
+            .as_ref()
+            .filter(|u| u.contract_id == tx.watched_contract_id)
+            .map(|u| (u.old_wasm_hash.clone(), u.new_wasm_hash.clone())),
+        _ => None,
+    }
 }
 
 /// The events an `EventEmitted` rule matched; empty for other rules.
 fn matched_events(rule: &AlertRule, tx: &EnrichedTransaction) -> Vec<ContractEvent> {
     match rule {
-        AlertRule::EventEmitted { topic, topics } => tx
+        AlertRule::EventEmitted {
+            topic,
+            topics,
+            data,
+        } => tx
             .events
             .iter()
-            .filter(|e| e.matches(topic, topics))
+            .filter(|e| e.matches(topic, topics, data))
             .cloned()
             .collect(),
         _ => Vec::new(),
@@ -771,9 +1004,12 @@ fn rule_label(rule: &AlertRule) -> String {
         }
         AlertRule::Not { rule: inner } => format!("Not({})", rule_label(&inner.rule)),
         AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
-        AlertRule::EventEmitted { topic, topics } => {
-            txwatch_config::event_emitted_label(topic, topics)
-        }
+        AlertRule::EventEmitted {
+            topic,
+            topics,
+            data,
+        } => txwatch_config::event_emitted_label(topic, topics, data),
+        AlertRule::ContractUpgraded => "ContractUpgraded".into(),
     }
 }
 
@@ -870,6 +1106,8 @@ pub fn check_no_activity(
                 matched_events: vec![],
                 suppressed_count: 0,
                 test: false,
+                old_wasm_hash: None,
+                new_wasm_hash: None,
                 enrichment_incomplete: false,
 
                 transaction_hash: synthetic_hash,
@@ -918,6 +1156,8 @@ pub fn check_no_activity(
                 matched_events: vec![],
                 suppressed_count: 0,
                 test: false,
+                old_wasm_hash: None,
+                new_wasm_hash: None,
                 enrichment_incomplete: false,
 
                 transaction_hash: synthetic_hash,
@@ -1125,7 +1365,10 @@ mod tests {
             memo: None,
             memo_type: None,
             operation_count: None,
+            watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             events: vec![],
+            contract_transfers: vec![],
+            wasm_upgrade: None,
             enrichment_incomplete: false,
         }
     }
@@ -1291,7 +1534,10 @@ mod tests {
             memo: None,
             memo_type: None,
             operation_count: None,
+            watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             events: vec![],
+            contract_transfers: vec![],
+            wasm_upgrade: None,
             enrichment_incomplete: false,
         };
         tx.successful = false; // satisfies TransactionFailed
@@ -1534,7 +1780,10 @@ mod tests {
                 memo: None,
                 memo_type: None,
                 operation_count: None,
+                watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
                 events: vec![],
+                contract_transfers: vec![],
+                wasm_upgrade: None,
                 enrichment_incomplete: false,
             };
             let rules = vec![entry(AlertRule::AnyTransaction)];
@@ -1789,6 +2038,8 @@ mod tests {
             matched_events: vec![],
             suppressed_count: 0,
             test: false,
+            old_wasm_hash: None,
+            new_wasm_hash: None,
             enrichment_incomplete: false,
         };
 
@@ -2253,7 +2504,10 @@ mod prop_tests {
             memo: None,
             memo_type: None,
             operation_count: None,
+            watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             events: vec![],
+            contract_transfers: vec![],
+            wasm_upgrade: None,
             enrichment_incomplete: false,
         }
     }
@@ -2562,7 +2816,10 @@ mod suppressor_tests {
             memo: None,
             memo_type: None,
             operation_count: None,
+            watched_contract_id: "CAAA".into(),
             events: vec![],
+            contract_transfers: vec![],
+            wasm_upgrade: None,
             enrichment_incomplete: false,
         };
         let ctx = EvalContext {
@@ -2660,7 +2917,10 @@ mod suppressor_tests {
             memo: None,
             memo_type: None,
             operation_count: None,
+            watched_contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             events: vec![],
+            contract_transfers: vec![],
+            wasm_upgrade: None,
             enrichment_incomplete: false,
         }
     }
@@ -2688,6 +2948,7 @@ mod suppressor_tests {
         AlertRule::EventEmitted {
             topic: topic.into(),
             topics: topics.iter().map(|t| t.to_string()).collect(),
+            data: vec![],
         }
     }
 
@@ -2725,10 +2986,150 @@ mod suppressor_tests {
     }
 
     #[test]
-    fn event_emitted_first_topic_must_be_a_symbol() {
+    fn event_emitted_first_topic_matches_any_scalar() {
+        // #263: a string topic 0 is now matchable.
         let ev = event(vec![serde_json::json!({"string": "transfer"})], Value::Null);
         let tx = make_tx(true, &[], None).with_events(vec![ev]);
-        assert!(run(&[event_rule("transfer", &[])], &tx).is_empty());
+        assert_eq!(run(&[event_rule("transfer", &[])], &tx).len(), 1);
+    }
+
+    #[test]
+    fn event_emitted_typed_topic_patterns() {
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        // Typed address pattern matches the address ScVal.
+        assert_eq!(
+            run(&[event_rule("transfer", &["address:GFROM"])], &tx).len(),
+            1
+        );
+        // Wrong type does not match.
+        assert!(run(&[event_rule("transfer", &["u32:GFROM"])], &tx).is_empty());
+        // Typed symbol pattern for topic 0.
+        assert_eq!(run(&[event_rule("symbol:transfer", &[])], &tx).len(), 1);
+        assert!(run(&[event_rule("string:transfer", &[])], &tx).is_empty());
+    }
+
+    #[test]
+    fn event_emitted_data_matchers() {
+        let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
+        let rule = |m: DataMatcher| AlertRule::EventEmitted {
+            topic: "transfer".into(),
+            topics: vec![],
+            data: vec![m],
+        };
+        // i128 data compared as an integer.
+        assert_eq!(
+            run(
+                &[rule(DataMatcher {
+                    pointer: String::new(),
+                    op: "gte".into(),
+                    value: "1000".into(),
+                })],
+                &tx
+            )
+            .len(),
+            1
+        );
+        assert!(run(
+            &[rule(DataMatcher {
+                pointer: String::new(),
+                op: "gte".into(),
+                value: "1001".into(),
+            })],
+            &tx
+        )
+        .is_empty());
+        assert_eq!(
+            run(
+                &[rule(DataMatcher {
+                    pointer: String::new(),
+                    op: "eq".into(),
+                    value: "1000".into(),
+                })],
+                &tx
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn data_matcher_pointer_and_integer_compare() {
+        let data = serde_json::json!({"amount": {"i128": "10000000000"}});
+        assert!(DataMatcher {
+            pointer: "/amount".into(),
+            op: "gte".into(),
+            value: "9999999999".into(),
+        }
+        .matches(&data));
+        assert!(!DataMatcher {
+            pointer: "/amount".into(),
+            op: "lte".into(),
+            value: "9999999999".into(),
+        }
+        .matches(&data));
+        assert!(!DataMatcher {
+            pointer: "/missing".into(),
+            op: "eq".into(),
+            value: "1".into(),
+        }
+        .matches(&data));
+    }
+
+    #[test]
+    fn large_transfer_filters_by_contract_and_direction() {
+        let mut tx = make_tx(true, &[], None);
+        tx.watched_contract_id = "CWATCHED".into();
+        tx.contract_transfers = vec![
+            ContractTransfer {
+                from: "GUNRELATED".into(),
+                to: "GOTHER".into(),
+                amount_stroops: 1_000_000_000_000,
+            },
+            ContractTransfer {
+                from: "GUSER".into(),
+                to: "CWATCHED".into(),
+                amount_stroops: 50_000_000,
+            },
+        ];
+        let rule = |direction: &str| {
+            entry(AlertRule::LargeTransfer {
+                threshold_xlm: 1,
+                threshold_stroops: 10_000_000,
+                direction: direction.into(),
+            })
+        };
+        // The unrelated 100k XLM transfer must not count.
+        assert_eq!(run(&[rule("any")], &tx).len(), 1);
+        assert_eq!(run(&[rule("in")], &tx).len(), 1);
+        assert!(run(&[rule("out")], &tx).is_empty());
+    }
+
+    #[test]
+    fn contract_upgraded_fires_and_reports_hashes() {
+        let mut tx = make_tx(true, &[], None);
+        tx.watched_contract_id = "CWATCHED".into();
+        tx.wasm_upgrade = Some(WasmUpgrade {
+            contract_id: "CWATCHED".into(),
+            old_wasm_hash: Some("aa".into()),
+            new_wasm_hash: Some("bb".into()),
+        });
+        let payloads = run(&[entry(AlertRule::ContractUpgraded)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "ContractUpgraded");
+        assert_eq!(payloads[0].old_wasm_hash.as_deref(), Some("aa"));
+        assert_eq!(payloads[0].new_wasm_hash.as_deref(), Some("bb"));
+    }
+
+    #[test]
+    fn contract_upgraded_ignores_other_contracts() {
+        let mut tx = make_tx(true, &[], None);
+        tx.watched_contract_id = "CWATCHED".into();
+        tx.wasm_upgrade = Some(WasmUpgrade {
+            contract_id: "COTHER".into(),
+            old_wasm_hash: None,
+            new_wasm_hash: Some("bb".into()),
+        });
+        assert!(run(&[entry(AlertRule::ContractUpgraded)], &tx).is_empty());
     }
 
     #[test]
@@ -2778,6 +3179,13 @@ mod suppressor_tests {
         let vec_val = serde_json::json!({"vec": [{"u32": 1}]});
         assert!(topic_value_matches(&vec_val, &vec_val.to_string()));
         assert!(!topic_value_matches(&vec_val, "1"));
+        // Typed patterns (#263).
+        assert!(topic_value_matches(&serde_json::json!({"u32": 5}), "u32:5"));
+        assert!(!topic_value_matches(&serde_json::json!({"u32": 5}), "i32:5"));
+        assert!(topic_value_matches(
+            &serde_json::json!({"address": "GABC"}),
+            "address:GABC"
+        ));
     }
 
     #[test]
@@ -2786,6 +3194,11 @@ mod suppressor_tests {
             rule_label(&event_rule("transfer", &["*", "GTO"])),
             "EventEmitted(transfer, *, GTO)"
         );
+    }
+
+    #[test]
+    fn contract_upgraded_label_is_stable() {
+        assert_eq!(rule_label(&AlertRule::ContractUpgraded), "ContractUpgraded");
     }
 
     // ── Issue #49: cooldowns ──────────────────────────────────────────────────
