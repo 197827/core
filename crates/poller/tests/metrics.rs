@@ -122,6 +122,8 @@ async fn operations_fetch_failure_is_reflected_in_degraded_metric() {
         .up_to_n_times(1)
         .mount(&horizon)
         .await;
+async fn reload_removes_series_of_dropped_contracts() {
+    let horizon = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
@@ -155,6 +157,21 @@ async fn operations_fetch_failure_is_reflected_in_degraded_metric() {
         http_connection_verbose: None,
         max_contracts: None,
         max_pages_per_cycle: None,
+
+    let config = |label: &str| {
+        let mut contract = helpers::contract("http://127.0.0.1:9/hook", vec![]);
+        contract.label = label.into();
+        contract.horizon_base_url_override = Some(horizon.uri());
+        AppConfig {
+            poll_interval_seconds: 5,
+            contracts: vec![contract],
+            cursor_file: None,
+            http_pool_max_idle_per_host: 10,
+            http_tcp_keepalive_secs: 30,
+            http_connection_verbose: None,
+            max_contracts: None,
+            max_pages_per_cycle: None,
+        }
     };
 
     let (_server_tx, server_rx) = watch::channel(false);
@@ -183,4 +200,53 @@ async fn operations_fetch_failure_is_reflected_in_degraded_metric() {
         body.contains(&format!("txwatch_transactions_degraded_total{labels} 1")),
         "{body}"
     );
+    let scrape = || async {
+        reqwest::get(format!("http://{addr}/metrics"))
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .unwrap()
+    };
+    let old = r#"txwatch_consecutive_poll_failures{contract="Reload Old",network="testnet"}"#;
+    let new = r#"txwatch_consecutive_poll_failures{contract="Reload New",network="testnet"}"#;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
+    let poller = tokio::spawn(txwatch_poller::run_with_reload(
+        config("Reload Old"),
+        false,
+        shutdown_rx,
+        reload_rx,
+    ));
+
+    let wait_for = |want: &'static str, present: bool| async move {
+        for _ in 0..100 {
+            if scrape().await.contains(want) == present {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "{want} present={present} never observed:\n{}",
+            scrape().await
+        );
+    };
+    wait_for(old, true).await;
+
+    reload_tx.send(config("Reload New")).await.unwrap();
+    wait_for(new, true).await;
+    let body = scrape().await;
+    assert!(!body.contains(old), "{body}");
+    assert!(
+        !body.contains(r#"txwatch_last_successful_poll_timestamp_seconds{contract="Reload Old""#),
+        "{body}"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), poller)
+        .await
+        .expect("poller should stop")
+        .unwrap()
+        .expect("poller should succeed");
 }

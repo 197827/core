@@ -391,6 +391,7 @@ async fn main() -> Result<()> {
                     format,
                     headers: parse_headers(&headers)?,
                     routing_key,
+                    ..Default::default()
                 };
                 destination.validate()?;
                 (vec![destination], selected)
@@ -844,6 +845,15 @@ fn describe_destination(destination: &WebhookDestination) -> String {
     if destination.routing_key.is_some() {
         parts.push(format!("routing_key: {}", REDACTED));
     }
+    if destination.client_cert.is_some() {
+        parts.push("mtls: set".to_string());
+    }
+    if let Some(min) = &destination.min_severity {
+        parts.push(format!("min_severity: {}", min));
+    }
+    if !destination.rule_types.is_empty() {
+        parts.push(format!("rule_types: {}", destination.rule_types.join(", ")));
+    }
     format!("{} ({})", destination.url, parts.join(", "))
 }
 
@@ -860,13 +870,16 @@ fn destination_summary_json(destination: &WebhookDestination) -> serde_json::Val
         "secret_set": destination.secret.is_some(),
         "headers": headers,
         "routing_key_set": destination.routing_key.is_some(),
+        "mtls_set": destination.client_cert.is_some(),
+        "min_severity": destination.min_severity,
+        "rule_types": destination.rule_types,
     })
 }
 
 fn parse_webhook_format(value: &str) -> Result<WebhookFormat, String> {
     serde_json::from_value(serde_json::Value::from(value)).map_err(|_| {
         format!(
-            "unknown format '{}': use txwatch, slack, discord or pagerduty",
+            "unknown format '{}': use txwatch, slack, discord, pagerduty or template",
             value
         )
     })

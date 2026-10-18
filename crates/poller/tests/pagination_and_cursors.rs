@@ -284,3 +284,163 @@ async fn ambiguous_legacy_cursor_starts_from_now_on_every_network() {
     assert_eq!(requested_cursors(&testnet).await, vec!["now"]);
     assert_eq!(requested_cursors(&futurenet).await, vec!["now"]);
 }
+
+// --- Soroban event stream pagination (issue #289) -------------------------
+//
+// `SorobanEventStreamer` must never send `startLedger` together with a
+// `pagination.cursor` (Soroban RPC rejects that combination), and it must only
+// advance its ledger watermark past the last event actually returned so that
+// unread events between a page and the tip are not skipped.
+
+/// A Soroban `getEvents` page with one event per ledger in `range`.
+fn soroban_page(range: std::ops::RangeInclusive<u32>, cursor: &str) -> serde_json::Value {
+    let events: Vec<_> = range
+        .map(|ledger| {
+            json!({
+                "type": "contract",
+                "ledger": ledger,
+                "ledgerClosedAt": "2024-06-01T10:00:00Z",
+                "contractId": ID,
+                "id": format!("{ledger}-1"),
+                "pagingToken": format!("{ledger}-1"),
+                "topic": [],
+                "value": { "xdr": "AAAAAA==" }
+            })
+        })
+        .collect();
+    json!({
+        "events": events,
+        "latestLedger": 1000,
+        "cursor": cursor
+    })
+}
+
+fn empty_soroban_page(cursor: &str) -> serde_json::Value {
+    json!({ "events": [], "latestLedger": 1000, "cursor": cursor })
+}
+
+/// The `startLedger` query parameter of every `getEvents` request, if present.
+async fn requested_start_ledgers(server: &MockServer) -> Vec<Option<String>> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/events"))
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "startLedger")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect()
+}
+
+/// The `cursor` query parameter of every `getEvents` request, if present.
+async fn requested_event_cursors(server: &MockServer) -> Vec<Option<String>> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/events"))
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "cursor")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect()
+}
+
+async fn serve_event_page(server: &MockServer, cursor: &str, page: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(path_regex("/events"))
+        .and(query_param("cursor", cursor))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn soroban_stream_omits_start_ledger_once_a_cursor_is_known() {
+    let server = MockServer::start().await;
+    serve_event_page(&server, "10-1", soroban_page(11..=11, "11-1")).await;
+    serve_event_page(&server, "11-1", empty_soroban_page("11-1")).await;
+    let file = cursor_file("soroban-cursor");
+    std::fs::write(&file, json!({ format!("testnet:{ID}"): "10-1" }).to_string()).unwrap();
+
+    txwatch_poller::run_once(
+        config(&contract_toml("soroban", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await
+    .unwrap();
+
+    // Every request carried a cursor and none carried `startLedger`.
+    let cursors = requested_event_cursors(&server).await;
+    assert!(!cursors.is_empty(), "expected at least one getEvents call");
+    assert!(cursors.iter().all(|c| c.is_some()));
+    assert!(
+        requested_start_ledgers(&server).await.iter().all(Option::is_none),
+        "startLedger must be omitted when a cursor is present"
+    );
+}
+
+#[tokio::test]
+async fn soroban_stream_advances_only_past_the_last_returned_event() {
+    let server = MockServer::start().await;
+    // First page returns events up to ledger 11 while the tip is 1000; the
+    // watermark must land on 11, not 1000, so ledgers 12..=1000 stay unread.
+    serve_event_page(&server, "10-1", soroban_page(11..=11, "11-1")).await;
+    serve_event_page(&server, "11-1", empty_soroban_page("11-1")).await;
+    let file = cursor_file("soroban-watermark");
+    std::fs::write(&file, json!({ format!("testnet:{ID}"): "10-1" }).to_string()).unwrap();
+
+    txwatch_poller::run_once(
+        config(&contract_toml("soroban", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let saved = read_cursors(&file);
+    assert_eq!(
+        saved.get(&format!("testnet:{ID}")).map(String::as_str),
+        Some("11-1"),
+        "watermark must stop at the last returned event, not the tip"
+    );
+}
+
+#[tokio::test]
+async fn soroban_stream_paginates_across_multiple_pages() {
+    let server = MockServer::start().await;
+    serve_event_page(&server, "10-1", soroban_page(11..=11, "11-1")).await;
+    serve_event_page(&server, "11-1", soroban_page(12..=12, "12-1")).await;
+    serve_event_page(&server, "12-1", empty_soroban_page("12-1")).await;
+    let file = cursor_file("soroban-multi-page");
+    std::fs::write(&file, json!({ format!("testnet:{ID}"): "10-1" }).to_string()).unwrap();
+
+    txwatch_poller::run_once(
+        config(&contract_toml("soroban", ID, "testnet"), &file, &[&server]),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let cursors: Vec<_> = requested_event_cursors(&server)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(cursors, vec!["10-1", "11-1", "12-1"]);
+    assert!(
+        requested_start_ledgers(&server).await.iter().all(Option::is_none),
+        "startLedger must be omitted on every cursor-based page"
+    );
+    let saved = read_cursors(&file);
+    assert_eq!(
+        saved.get(&format!("testnet:{ID}")).map(String::as_str),
+        Some("12-1")
+    );
+}

@@ -109,6 +109,27 @@ fn contract_function_name(parameters: &[HorizonParameter]) -> Option<String> {
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 
+/// Internal parsers exposed for the fuzz targets in `fuzz/`. Not a public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub fn parse_stroops(amount: &str) -> Option<u64> {
+        super::parse_stroops(amount).ok()
+    }
+
+    pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+        super::base64_decode(input)
+    }
+
+    /// Decodes `value` as the base64 XDR of a `Sym` invocation parameter.
+    pub fn contract_function_name(value: &str) -> Option<String> {
+        super::contract_function_name(&[super::HorizonParameter {
+            scv_type: "Sym".to_owned(),
+            value: value.to_owned(),
+        }])
+    }
+}
+
 /// Minimal standard-alphabet base64 decoder, so the poller does not need a
 /// new dependency for the one `ScVal` it decodes. Padding is optional.
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
@@ -242,17 +263,20 @@ struct Counters {
     interval_transactions: AtomicU64,
     interval_alerts: AtomicU64,
     interval_skipped: AtomicU64,
+    interval_suppressed: AtomicU64,
 }
 
 impl Counters {
     /// Adds the outcome of one poll of one contract to the running totals.
-    fn record_poll(&self, txs: u64, alerts: u64, skipped: u64) {
+    fn record_poll(&self, txs: u64, alerts: u64, skipped: u64, suppressed: u64) {
         self.transactions.fetch_add(txs, Ordering::Relaxed);
         self.alerts.fetch_add(alerts, Ordering::Relaxed);
         self.skipped.fetch_add(skipped, Ordering::Relaxed);
         self.interval_transactions.fetch_add(txs, Ordering::Relaxed);
         self.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
         self.interval_skipped.fetch_add(skipped, Ordering::Relaxed);
+        self.interval_suppressed
+            .fetch_add(suppressed, Ordering::Relaxed);
     }
 }
 
@@ -379,6 +403,7 @@ pub async fn run_with_reload(
                     let interval_txs = c.interval_transactions.swap(0, Ordering::Relaxed);
                     let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
                     let interval_skipped = c.interval_skipped.swap(0, Ordering::Relaxed);
+                    let interval_suppressed = c.interval_suppressed.swap(0, Ordering::Relaxed);
                     info!(
                         contracts = c.contracts.load(Ordering::Relaxed),
                         transactions_total = c.transactions.load(Ordering::Relaxed),
@@ -387,6 +412,7 @@ pub async fn run_with_reload(
                         transactions_interval = interval_txs,
                         alerts_interval = interval_alerts,
                         skipped_interval = interval_skipped,
+                        suppressed_interval = interval_suppressed,
                         "60-second summary"
                     );
                 }
@@ -523,7 +549,21 @@ pub async fn run_with_reload(
             .contracts
             .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
-        metrics::set_poll_interval(new_cfg.poll_interval_seconds);
+        {
+            metrics::set_poll_interval(new_cfg.poll_interval_seconds);
+            // Drop the series of contracts no longer polled under the same
+            // label and network, or freshness alerts would fire for them forever.
+            for old in cfg.contracts.iter().filter(|c| c.enabled) {
+                let network = old.network.as_str();
+                let still_polled = new_cfg
+                    .contracts
+                    .iter()
+                    .any(|c| c.enabled && c.label == old.label && c.network.as_str() == network);
+                if !still_polled {
+                    metrics::remove_contract(&old.label, network);
+                }
+            }
+        }
         info!(
             contracts = new_cfg.contracts.len(),
             interval_secs = new_cfg.poll_interval_seconds,
@@ -611,6 +651,13 @@ async fn poll_contract_forever(
         mut cooldowns,
         mut health,
     } = runtime;
+    // Poll state and cooldowns live as long as this contract's task.
+    let mut state = ContractPollState::default();
+    // A single tracker for this contract's lifetime, so cooldowns survive
+    // across poll cycles rather than deduping only within one.
+    let mut cooldowns = CooldownTracker::new();
+    let mut health = PollHealth::default();
+    let lag_threshold = ledger_lag_warn_threshold_from_env();
     // Polls are paced by a fixed-period ticker, so the period stays at
     // `interval` however long a cycle takes. The first poll happens
     // immediately; the per-contract offset staggers every poll after it so
@@ -641,7 +688,20 @@ async fn poll_contract_forever(
                         "contract recovered"
                     );
                 }
-                counters.record_poll(txs, alerts, skipped);
+                counters.record_poll(txs, alerts, skipped, state.suppressed);
+                if let Some(lag) = ledger_lag(&client, &contract, &state).await {
+                    if lag > lag_threshold {
+                        warn!(
+                            contract = %contract.label,
+                            network = %contract.network.as_str(),
+                            ledger_lag = lag,
+                            threshold = lag_threshold,
+                            "contract is falling behind the network tip"
+                        );
+                    }
+                    #[cfg(feature = "metrics")]
+                    metrics::set_ledger_lag(&contract.label, contract.network.as_str(), lag);
+                }
                 // Issue #25: increment Prometheus counters when metrics feature is enabled.
                 #[cfg(feature = "metrics")]
                 {
@@ -1153,6 +1213,58 @@ pub struct ContractPollState {
     pub no_activity_states: Vec<NoActivityState>,
     /// Suppresses repeated evaluation warnings for broken rules.
     pub suppressor: WarningSuppressor,
+    /// Rule matches dropped by a cooldown in the last poll cycle.
+    pub suppressed: u64,
+    /// Ledger of the last processed transaction, if Horizon reported one.
+    pub last_ledger: Option<u32>,
+    /// Whether the last poll cycle stopped with transactions still pending.
+    pub backlogged: bool,
+}
+
+/// Env var holding the ledger lag above which a warning is logged.
+const LEDGER_LAG_WARN_ENV: &str = "TXWATCH_LEDGER_LAG_WARN_THRESHOLD";
+/// About an hour of ledgers at ~5 s each.
+const DEFAULT_LEDGER_LAG_WARN_THRESHOLD: u64 = 720;
+
+fn ledger_lag_warn_threshold_from_env() -> u64 {
+    std::env::var(LEDGER_LAG_WARN_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LEDGER_LAG_WARN_THRESHOLD)
+}
+
+/// Ledgers between Horizon's latest ledger and the last processed
+/// transaction. `0` when the last cycle drained everything pending; `None`
+/// when the lag cannot be determined. Horizon is only asked when behind.
+async fn ledger_lag(
+    client: &Client,
+    contract: &WatchedContract,
+    state: &ContractPollState,
+) -> Option<u64> {
+    if !state.backlogged {
+        return Some(0);
+    }
+    let last = state.last_ledger?;
+    let url = format!("{}/", poll_base_url(contract));
+    let latest = async {
+        let root: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::Ok(root["history_latest_ledger"].as_u64())
+    }
+    .await;
+    match latest {
+        Ok(Some(latest)) => Some(latest.saturating_sub(u64::from(last))),
+        Ok(None) => None,
+        Err(error) => {
+            debug!(contract = %contract.label, error = %error, "could not fetch Horizon's latest ledger");
+            None
+        }
+    }
 }
 
 /// Returns `(transactions_processed, alerts_fired, webhook_failures, transactions_skipped)`.
@@ -1283,6 +1395,8 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
     let mut skipped = 0u64;
+    state.suppressed = 0;
+    state.backlogged = false;
     // Contract events per ledger, fetched at most once per cycle and only
     // when the contract has an EventEmitted rule.
     let mut events_by_ledger: HashMap<u32, Vec<RpcEvent>> = HashMap::new();
@@ -1309,6 +1423,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 "reached max_pages_per_cycle; more transactions may be pending — continuing \
                  from the saved cursor next cycle"
             );
+            state.backlogged = true;
             break;
         }
 
@@ -1328,6 +1443,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                     error = %error,
                     "failed to fetch a later page; continuing from the saved cursor next cycle"
                 );
+                state.backlogged = true;
                 break;
             }
         };
@@ -1374,6 +1490,9 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             };
 
             let ledger = record.tx.ledger;
+            if ledger.is_some() {
+                state.last_ledger = ledger;
+            }
             let enriched = match EnrichedTransaction::from_horizon(
                 record.tx,
                 function_names,
@@ -1420,7 +1539,29 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 debug!(contract = %contract.label, tx = %tx_hash,
                     "transaction evaluated but no rules matched");
             }
+            let mut matched: Vec<(String, String)> = payloads
+                .iter()
+                .map(|p| (p.rule_triggered.clone(), p.rule_type.clone()))
+                .collect();
             let payloads = cooldowns.apply(&contract.rules, payloads, chrono::Utc::now());
+            for payload in &payloads {
+                if let Some(i) = matched
+                    .iter()
+                    .position(|(rule, _)| *rule == payload.rule_triggered)
+                {
+                    matched.swap_remove(i);
+                }
+            }
+            // What is left in `matched` was dropped by a cooldown.
+            state.suppressed += matched.len() as u64;
+            #[cfg(feature = "metrics")]
+            for (_, rule_type) in &matched {
+                metrics::inc_alerts_suppressed(
+                    &contract.label,
+                    contract.network.as_str(),
+                    rule_type,
+                );
+            }
 
             for payload in payloads {
                 alert_count += 1;
@@ -1502,8 +1643,15 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             shutdown_rx,
         )
         .await;
+        // Batches always go to the `webhook_url` shorthand in the txwatch format.
         #[cfg(feature = "metrics")]
-        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+        metrics::record_webhook_delivery(
+            &contract.label,
+            "txwatch",
+            "0",
+            delivery.is_ok(),
+            started.elapsed().as_secs_f64(),
+        );
         if let Err(e) = delivery {
             error!(contract = %contract.label, alerts = chunk.len(), error = %e,
                 "batched webhook delivery failed");
@@ -1564,6 +1712,10 @@ async fn deliver_payload(
         warn!(contract = %contract.label, "no webhook destination configured — dropping alert");
         return;
     }
+    let destinations: Vec<WebhookDestination> = destinations
+        .into_iter()
+        .filter(|d| d.accepts(payload.severity.as_deref(), &payload.rule_type))
+        .collect();
 
     *webhook_failures += deliver_to_all(client, contract, &destinations, payload).await;
 }
@@ -1577,15 +1729,26 @@ async fn deliver_to_all(
     destinations: &[WebhookDestination],
     payload: &txwatch_rules::AlertPayload,
 ) -> u64 {
-    let deliveries = destinations.iter().map(|destination| async move {
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        #[cfg(feature = "metrics")]
-        let started = std::time::Instant::now();
-        let delivery = send_to_destination(client, destination, payload, shutdown_rx).await;
-        #[cfg(feature = "metrics")]
-        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
-        (destination, delivery)
-    });
+    let deliveries = destinations
+        .iter()
+        .enumerate()
+        .map(|(index, destination)| async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            #[cfg(feature = "metrics")]
+            let started = std::time::Instant::now();
+            let delivery = send_to_destination(client, destination, payload, shutdown_rx).await;
+            #[cfg(feature = "metrics")]
+            metrics::record_webhook_delivery(
+                &contract.label,
+                &destination.format.to_string(),
+                &index.to_string(),
+                delivery.is_ok(),
+                started.elapsed().as_secs_f64(),
+            );
+            #[cfg(not(feature = "metrics"))]
+            let _ = index;
+            (destination, delivery)
+        });
 
     let mut failures = 0;
     for (destination, delivery) in futures::future::join_all(deliveries).await {
