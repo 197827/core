@@ -164,3 +164,26 @@ async fn test_concurrent_deliveries_keep_span_attribution() {
         }
     }
 }
+
+/// Snapshot test: a resolved (recovery / NoActivity) alert must be sent to
+/// PagerDuty as `event_action: "resolve"` carrying the incident's `dedup_key`,
+/// so the existing incident is resolved instead of a new one being triggered.
+#[test]
+fn test_pagerduty_resolve_snapshot() {
+    let mut payload = test_payload("PagerDutyRecovery");
+    payload.resolved = true;
+
+    let body = txwatch_notifier::format::pagerduty(&payload);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(
+        value["event_action"], "resolve",
+        "resolved alerts must use event_action=resolve"
+    );
+    assert!(
+        value.get("dedup_key").and_then(|v| v.as_str()).is_some(),
+        "resolve payload must include the incident dedup_key"
+    );
+
+    insta::assert_snapshot!(body);
+}
