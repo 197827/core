@@ -120,6 +120,8 @@ docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch validate
 To watch contracts on a local standalone network, `docker compose -f docker-compose.local.yml up`
 starts `stellar/quickstart --local` together with TxWatch using [`config/local.toml`](config/local.toml).
 
+For Kubernetes, a Helm chart lives in [`deploy/helm/txwatch`](deploy/helm/txwatch); see [docs/kubernetes.md](docs/kubernetes.md).
+
 For local development with webhook testing, see [Local Development with Docker Compose](#local-development-with-docker-compose) in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
@@ -127,15 +129,17 @@ For local development with webhook testing, see [Local Development with Docker C
 ## CLI
 
 ```
-txwatch [--config <path>] <command>
+txwatch [--config <path>] [--horizon-url <URL>] <command>
 
 Commands:
-  watch                        Start the polling engine
-  validate                     Validate the config file and print a summary
-  test-webhook --url <URL>     Send a test payload to a webhook URL and exit
-  init                         Write a starter config (prompts for anything not passed)
-  completions <shell>          Print a completion script (bash, zsh, fish, powershell, elvish)
-  man                          Print the txwatch(1) man page
+  watch [--once] [--dry-run]     Start the polling engine
+  validate [--format text|json]  Validate the config file and print a summary
+  test-webhook --url <URL>       Send a test payload to a webhook URL and exit
+  replay --contract <label> --tx <hash> [--send]
+                                 Evaluate a contract's rules against one transaction
+  init                           Write a starter config (prompts for anything not passed)
+  completions <shell>            Print a completion script (bash, zsh, fish, powershell, elvish)
+  man                            Print the txwatch(1) man page
 ```
 
 Install completions with e.g. `txwatch completions bash > ~/.local/share/bash-completion/completions/txwatch`
@@ -148,14 +152,6 @@ Start a new config with `txwatch init --contract-id C... --network testnet --web
 The generated file is validated before it's written, and an existing file is only replaced with
 `--force`.
 
-`--config` defaults to `config/example.toml`.
-  watch [--once] [--dry-run]     Start the polling engine
-  validate [--format text|json]  Validate the config file and print a summary
-  test-webhook --url <URL>       Send a test payload to a webhook URL and exit
-  replay --contract <label> --tx <hash> [--send]
-                                 Evaluate a contract's rules against one transaction
-```
-
 `replay` fetches a historical transaction and its operations from Horizon, runs the named
 contract's rules against it and prints every matched rule with its webhook payload, so rule authors
 can check "would my rules have fired for transaction X?". Nothing is sent unless `--send` is given.
@@ -163,7 +159,7 @@ can check "would my rules have fired for transaction X?". Nothing is sent unless
 `validate --format json` prints the parsed config as a single JSON object (webhook secrets are
 redacted to `webhook_secret_set`), or `{"valid": false, "error": "..."}` with exit code 1.
 
-`--config` defaults to `config/example.toml`. `--horizon-url <URL>` overrides the Horizon base URL
+`--horizon-url <URL>` overrides the Horizon base URL
 for every contract (for example a private Horizon instance).
 
 `watch --once` runs a single poll cycle, delivers any alerts, saves cursors to `cursor_file` (if
@@ -227,7 +223,8 @@ webhook_url = "https://hooks.example.com/my-webhook"
 | `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
-| `HighFee` | Transaction fee exceeds configured threshold |
+| `HighFee` | Transaction fee is greater than or equal to `threshold_stroops` (or `threshold_xlm`) |
+| `EventEmitted` | The transaction emitted a contract event whose first topic is a given symbol |
 | `SourceAccount` | Transaction source account matches an allow/deny list |
 | `All` | All nested rules match (logical AND) |
 | `Any` | Any nested rule matches (logical OR) |
@@ -238,8 +235,6 @@ Every rule entry also supports:
 - `webhook_url` — per-rule webhook URL override (falls back to the contract's URL)
 - `webhook_secret` — per-rule webhook secret override
 - `severity` — `info`, `warning`, or `critical`; included in the alert payload
-| `HighFee` | Transaction fee is greater than or equal to `threshold_stroops` (or `threshold_xlm`) |
-| `EventEmitted` | The transaction emitted a contract event whose first topic is a given symbol |
 
 Any rule can set `cooldown_seconds` to send at most one alert per window for that rule on that contract;
 suppressed matches are reported in `suppressed_count` on the next alert.
@@ -252,8 +247,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 
 ```json
 {
-  "schema_version":     1,
-  "alert_id":           "a3f1bc20e94d77c1a3f1bc20e94d77c1",
+  "schema_version":   1,
   "alert_id":         "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
   "label":            "My Escrow Contract",
   "contract_id":      "CAAA...",
@@ -297,7 +291,6 @@ service. See [Multiple destinations](docs/configuration.md#multiple-destinations
 **Fields:**
 - `schema_version` — integer version of this payload shape (currently `1`). Additive changes (new optional fields) keep the same version; breaking changes (field removals or renames) bump it. Receivers should use this to detect incompatible changes.
 - `alert_id` — stable, deterministic identifier derived from `(network, contract_id, tx_hash, rule_type, rule_triggered)` via SHA-256 prefix (32 hex chars). Identical for every retry of the same alert. Receivers should deduplicate on this value.
-- `alert_id` — stable ID of this alert (same contract, transaction and rule → same ID); use it to de-duplicate redeliveries
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`, `"HighFee"`); use this for programmatic routing
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
@@ -392,6 +385,10 @@ scrape_configs:
       - targets: ['localhost:9090']
 ```
 
+Ready-made alerting rules for TxWatch's own health (stale polls, consecutive poll failures,
+webhook failure rate) are in [`deploy/prometheus/txwatch-alerts.yml`](deploy/prometheus/txwatch-alerts.yml)
+and a Grafana dashboard is in [`deploy/grafana/txwatch.json`](deploy/grafana/txwatch.json).
+
 ---
 
 ## How a transaction flows through TxWatch
@@ -441,30 +438,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 [Apache-2.0](LICENSE)
 
-## Handsoff notes
-
-<!-- handsoff-issue-35 -->
-- #35: HTTP timeouts for Horizon and webhooks are hard-coded to 15 seconds
-
-<!-- handsoff-issue-38 -->
-- #38: startup_log_fields test helper duplicates production logic instead of testing it
-<!-- handsoff-issue-24 -->
-- #24: No way to configure a custom Horizon URL per contract
-
-<!-- handsoff-issue-26 -->
-- #26: Allow a starting cursor or ledger instead of always starting from "now"
-<!-- handsoff-issue-33 -->
-- #33: http_connection_verbose is parsed but never used
-
-<!-- handsoff-issue-34 -->
-- #34: http_tcp_keepalive_secs = 0 does not disable keepalive
-<!-- handsoff-issue-27 -->
-- #27: A corrupt cursor_file silently resets every contract to "now"
-
-<!-- handsoff-issue-28 -->
-- #28: Ctrl-C waits for webhook retries to finish before shutting down
-<!-- handsoff-issue-39 -->
-- #39: Tests sleep in real time for back-offs, slowing the suite by many seconds
-
-<!-- handsoff-issue-41 -->
-- #41: FunctionCalled is case-sensitive while AdminFunctionCalled is case-insensitive

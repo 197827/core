@@ -1659,6 +1659,15 @@ fn is_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Internal parsers exposed for the fuzz targets in `fuzz/`. Not a public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub fn interpolate(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+        super::interpolate(value, lookup).ok()
+    }
+}
+
 /// Expands environment-variable references anywhere in `value`:
 ///
 /// - `${VAR}` is replaced by the value of `VAR`; an unset variable is an error.

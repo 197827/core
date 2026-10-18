@@ -6,6 +6,7 @@ members = [
     "crates/poller",
     "crates/cli",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
