@@ -59,7 +59,11 @@ pub(crate) fn poll_ticker(interval: Duration, offset: Duration) -> tokio::time::
 }
 
 /// Failure streak and last-success time for one contract.
-#[derive(Debug, Default)]
+///
+/// Cloneable so the reload path can carry health state forward for contracts
+/// whose rules did not change instead of recreating it (which would forget
+/// failure streaks and re-trigger unhealthy/recovered transitions).
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PollHealth {
     consecutive_failures: u32,
     last_success: Option<Instant>,

@@ -106,3 +106,81 @@ async fn mocked_poll_is_reflected_in_metrics_endpoint() {
     let missing = reqwest::get(format!("http://{addr}/nope")).await.unwrap();
     assert_eq!(missing.status(), 404);
 }
+
+#[tokio::test]
+async fn operations_fetch_failure_is_reflected_in_degraded_metric() {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::tx_page(
+            "degraded001",
+            "701",
+            true,
+        )))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+    // Every operations fetch fails: the transaction is evaluated without
+    // operation details and must be counted as degraded.
+    Mock::given(method("GET"))
+        .and(path("/transactions/degraded001/operations"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&horizon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.label = "Degraded Test Contract".into();
+    contract.horizon_base_url_override = Some(horizon.uri());
+    let cfg = AppConfig {
+        poll_interval_seconds: 5,
+        contracts: vec![contract],
+        cursor_file: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+    };
+
+    let (_server_tx, server_rx) = watch::channel(false);
+    let addr = txwatch_poller::serve_metrics("127.0.0.1:0".parse().unwrap(), server_rx)
+        .await
+        .expect("start metrics endpoint");
+
+    let (poller_tx, poller_rx) = watch::channel(false);
+    poller_tx.send(true).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        txwatch_poller::run_with_shutdown(cfg, false, poller_rx),
+    )
+    .await
+    .expect("poll cycle should finish")
+    .expect("poller should succeed");
+
+    let body = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .expect("scrape /metrics")
+        .text()
+        .await
+        .unwrap();
+    let labels = r#"{contract="Degraded Test Contract",network="testnet"}"#;
+    assert!(
+        body.contains(&format!("txwatch_transactions_degraded_total{labels} 1")),
+        "{body}"
+    );
+}

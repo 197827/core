@@ -300,7 +300,14 @@ pub async fn run_with_reload(
     // Shared so each contract's task can persist the whole cursor map after a
     // cycle that advanced its own cursor.
     let cursors = Arc::new(Mutex::new(load_cursors(&cfg)));
-    let cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
+    // Issue #275: per-contract runtime state (cooldowns, poll state, health)
+    // lives here, keyed by `cursor_key`, so it survives config reloads instead
+    // of being recreated with every generation of polling tasks.
+    let runtime_states: Arc<Mutex<HashMap<String, ContractRuntimeState>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    // Issue #276: the persistence path is recomputed from the active config
+    // each generation rather than captured once here.
+    let mut cursor_file = cfg.cursor_file.clone().map(PathBuf::from);
 
     #[cfg(feature = "metrics")]
     {
@@ -404,6 +411,30 @@ pub async fn run_with_reload(
             }
             let interval =
                 Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
+            let key = contract.cursor_key();
+            // Issue #275: reuse the runtime state of a contract that is still
+            // configured with the same rules; only reset it when the rules
+            // actually changed (or the contract is new).
+            let state = {
+                let mut states = lock(&runtime_states);
+                match states.get(&key) {
+                    Some(existing) if existing.rules == contract.rules => existing.clone(),
+                    Some(_) => {
+                        info!(
+                            contract = %contract.label,
+                            "rules changed on reload — resetting cooldowns and poll state"
+                        );
+                        let fresh = ContractRuntimeState::new(contract);
+                        states.insert(key.clone(), fresh.clone());
+                        fresh
+                    }
+                    None => {
+                        let fresh = ContractRuntimeState::new(contract);
+                        states.insert(key.clone(), fresh.clone());
+                        fresh
+                    }
+                }
+            };
             tasks.spawn(poll_contract_forever(
                 client.clone(),
                 contract.clone(),
@@ -416,6 +447,7 @@ pub async fn run_with_reload(
                     cursors: Arc::clone(&cursors),
                     path: cursor_file.clone(),
                 },
+                state,
             ));
         }
 
@@ -428,8 +460,9 @@ pub async fn run_with_reload(
         let _ = stop_tx.send(true);
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((key, cursor)) => {
-                    lock(&cursors).insert(key, cursor);
+                Ok((key, cursor, state)) => {
+                    lock(&cursors).insert(key.clone(), cursor);
+                    lock(&runtime_states).insert(key, state);
                 }
                 Err(e) => error!(error = ?e, "contract polling task panicked"),
             }
@@ -442,22 +475,50 @@ pub async fn run_with_reload(
 
         let Some(new_cfg) = new_cfg else { break };
         let start = load_cursors(&new_cfg);
+        // Issue #277: keep cursors for contracts that are no longer configured
+        // so that temporarily removing and re-adding a contract does not lose
+        // every transaction in between.
+        let mut merged: HashMap<String, String> = lock(&cursors).clone();
+        for (key, cursor) in start {
+            merged.entry(key).or_insert(cursor);
+        }
         // Existing cursors win over the reloaded config's file; contracts new
         // to the config start from the saved cursor, else `now`.
-        let merged: HashMap<String, String> = new_cfg
-            .contracts
-            .iter()
-            .map(|c| {
-                let key = c.cursor_key();
-                let cursor = lock(&cursors)
-                    .get(&key)
-                    .or_else(|| start.get(&key))
-                    .cloned()
-                    .unwrap_or_else(|| "now".to_string());
-                (key, cursor)
-            })
-            .collect();
+        for c in &new_cfg.contracts {
+            merged
+                .entry(c.cursor_key())
+                .or_insert_with(|| "now".to_string());
+        }
         *lock(&cursors) = merged;
+
+        // Issue #276: recompute the persistence path from the new config and
+        // migrate the cursor file when the path changed.
+        let new_cursor_file = new_cfg.cursor_file.clone().map(PathBuf::from);
+        if new_cursor_file != cursor_file {
+            match (&cursor_file, &new_cursor_file) {
+                (Some(old), Some(new)) => {
+                    warn!(
+                        old_path = %old.display(),
+                        new_path = %new.display(),
+                        "cursor_file changed on reload — migrating saved cursors"
+                    );
+                    if let Err(e) = write_cursor_file(new, &lock(&cursors)) {
+                        error!(error = %e, "failed to migrate cursors to the new cursor_file");
+                    }
+                }
+                (Some(old), None) => warn!(
+                    old_path = %old.display(),
+                    "cursor_file removed on reload — cursors will no longer be persisted"
+                ),
+                (None, Some(new)) => info!(
+                    new_path = %new.display(),
+                    "cursor_file added on reload — cursors will now be persisted"
+                ),
+                (None, None) => {}
+            }
+            cursor_file = new_cursor_file;
+        }
+
         counters
             .contracts
             .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
@@ -497,9 +558,33 @@ fn log_poll_failure(contract: &WatchedContract, consecutive_failures: u32, error
     );
 }
 
+/// Per-contract runtime state that must survive config reloads (issue #275):
+/// cooldowns, poll state (`last_seen`, `NoActivity` states, warning suppressor)
+/// and health. It is handed back to the reload loop when a task ends so the
+/// next generation can reuse it.
+#[derive(Clone)]
+struct ContractRuntimeState {
+    /// The rules this state was built for; a change resets the state.
+    rules: Vec<txwatch_config::RuleConfig>,
+    state: ContractPollState,
+    cooldowns: CooldownTracker,
+    health: PollHealth,
+}
+
+impl ContractRuntimeState {
+    fn new(contract: &WatchedContract) -> Self {
+        Self {
+            rules: contract.rules.clone(),
+            state: ContractPollState::default(),
+            cooldowns: CooldownTracker::new(),
+            health: PollHealth::default(),
+        }
+    }
+}
+
 /// Polls one contract every `interval` until `stop` reports `true`, finishing
-/// the in-flight poll first. Returns the contract's cursor key and its latest
-/// cursor.
+/// the in-flight poll first. Returns the contract's cursor key, its latest
+/// cursor and its runtime state.
 #[allow(clippy::too_many_arguments)]
 async fn poll_contract_forever(
     client: Client,
@@ -510,19 +595,22 @@ async fn poll_contract_forever(
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
     persist: CursorPersistence,
-) -> (String, String) {
+    runtime: ContractRuntimeState,
+) -> (String, String, ContractRuntimeState) {
     let key = contract.cursor_key();
     let cursor = lock(&persist.cursors)
         .get(&key)
         .cloned()
         .unwrap_or_else(|| "now".to_string());
     let mut cursors = HashMap::from([(key.clone(), cursor)]);
-    // Poll state and cooldowns live as long as this contract's task.
-    let mut state = ContractPollState::default();
-    // A single tracker for this contract's lifetime, so cooldowns survive
-    // across poll cycles rather than deduping only within one.
-    let mut cooldowns = CooldownTracker::new();
-    let mut health = PollHealth::default();
+    // Poll state and cooldowns live as long as this contract's task, and are
+    // carried across reloads via `runtime`.
+    let ContractRuntimeState {
+        rules,
+        mut state,
+        mut cooldowns,
+        mut health,
+    } = runtime;
     // Polls are paced by a fixed-period ticker, so the period stays at
     // `interval` however long a cycle takes. The first poll happens
     // immediately; the per-contract offset staggers every poll after it so
@@ -626,7 +714,16 @@ async fn poll_contract_forever(
     }
 
     let cursor = cursors.remove(&key).unwrap_or_else(|| "now".to_string());
-    (key, cursor)
+    (
+        key,
+        cursor,
+        ContractRuntimeState {
+            rules,
+            state,
+            cooldowns,
+            health,
+        },
+    )
 }
 
 /// Reads the raw cursor map from `path`. An unreadable or unparseable file is
