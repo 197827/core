@@ -1023,6 +1023,15 @@ impl CooldownTracker {
 
 // ── Glob matching (issue #55) ─────────────────────────────────────────────────
 
+/// Internal parsers exposed for the fuzz targets in `fuzz/`. Not a public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub fn glob_match(pattern: &str, text: &str) -> bool {
+        super::glob_match(pattern, text)
+    }
+}
+
 /// Match `text` against a `pattern` that may contain `*` (any sequence of
 /// characters) and `?` (exactly one character). All other characters are
 /// matched literally, case-sensitively.
