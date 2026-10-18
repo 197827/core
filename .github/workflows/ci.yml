@@ -24,6 +24,43 @@ jobs:
           jq -e '.properties.poll_interval_seconds and .properties.contracts and .definitions.WatchedContract and .definitions.AlertRule' docs/txwatch-config.schema.json
           test "$(jq -r '.properties.contracts.items."$ref"' /tmp/txwatch-config.schema.json)" = "#/$defs/WatchedContract"
 
+  # ── Monitoring assets ───────────────────────────────────────────────────────
+  promtool:
+    name: Prometheus rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check alerting rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" --entrypoint promtool \
+            prom/prometheus:v3.5.0 check rules /rules/txwatch-alerts.yml
+      - name: Check Grafana dashboard is valid JSON
+        run: jq -e '.panels | length > 0' deploy/grafana/txwatch.json
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/txwatch
+      - run: helm template txwatch deploy/helm/txwatch --set metrics.serviceMonitor.enabled=true --set metrics.prometheusRule.enabled=true > /dev/null
+
+  # ── Fuzz smoke test ─────────────────────────────────────────────────────────
+  fuzz:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run each target for 30 seconds
+        run: |
+          for target in $(cargo fuzz list); do
+            cargo fuzz run "$target" -- -max_total_time=30
+          done
+
   # ── Format ──────────────────────────────────────────────────────────────────
   fmt:
     name: Rustfmt

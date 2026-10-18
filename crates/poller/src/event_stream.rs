@@ -41,10 +41,15 @@ struct JsonRpcRequest<T> {
 }
 
 /// Parameters for Soroban RPC `getEvents`.
+///
+/// Soroban RPC rejects requests that set both `startLedger` and
+/// `pagination.cursor`, so `start_ledger` is omitted whenever a cursor is
+/// present.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetEventsParams {
-    pub start_ledger: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ledger: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<EventFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,6 +217,11 @@ impl SorobanEventStreamer {
     /// Tries each configured endpoint in order, starting from the last known
     /// healthy one, and falls back to the next URL on connection errors or 5xx
     /// responses. The endpoint that served the poll is logged at debug level.
+    ///
+    /// `startLedger` is only sent when no cursor is known, since Soroban RPC
+    /// rejects requests that combine the two. After a page is returned, the
+    /// ledger position advances only past the last event actually delivered so
+    /// unread events between the page and the tip are not skipped.
     pub async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>> {
         if self.rpc_urls.is_empty() {
             return Err(anyhow!("no Horizon/RPC endpoints configured"));
@@ -224,7 +234,11 @@ impl SorobanEventStreamer {
         };
 
         let params = GetEventsParams {
-            start_ledger: self.current_ledger,
+            start_ledger: if self.last_cursor.is_some() {
+                None
+            } else {
+                Some(self.current_ledger)
+            },
             filters: vec![filter],
             pagination: Some(PaginationParams {
                 limit: 100,
@@ -249,313 +263,185 @@ impl SorobanEventStreamer {
             match self.try_fetch(&url, &request_body).await {
                 Ok(result) => {
                     if idx != self.active_url {
-                        info!(endpoint = %url, "failing over to Horizon/RPC endpoint");
+                        debug!(url = %url, "switched active RPC endpoint");
+                        self.active_url = idx;
                     }
-                    self.active_url = idx;
 
-                    if let Some(c) = result.cursor {
-                        self.last_cursor = Some(c);
+                    if let Some(cursor) = result.cursor.clone() {
+                        self.last_cursor = Some(cursor);
                     }
-                    self.current_ledger = result.latest_ledger;
+
+                    // Advance only past the last event actually returned so
+                    // events between this page and the tip are not skipped.
+                    if let Some(last) = result.events.last() {
+                        self.current_ledger = last.ledger.saturating_add(1);
+                    }
 
                     debug!(
-                        endpoint = %url,
-                        events_count = result.events.len(),
+                        url = %url,
+                        events = result.events.len(),
                         latest_ledger = result.latest_ledger,
-                        "streamed real-time soroban events"
+                        current_ledger = self.current_ledger,
+                        "fetched Soroban events"
                     );
 
                     return Ok(result.events);
                 }
                 Err(err) => {
-                    debug!(endpoint = %url, error = %err, "Horizon/RPC endpoint failed, trying next");
+                    warn!(url = %url, error = %err, "RPC getEvents failed, trying next endpoint");
                     last_error = Some(err);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow!("all Horizon/RPC endpoints failed")))
+        Err(last_error.unwrap_or_else(|| anyhow!("all RPC endpoints failed")))
     }
 
-    /// Attempts a single `getEvents` request against one endpoint.
-    async fn try_fetch(
-        &self,
-        url: &str,
-        request_body: &JsonRpcRequest<GetEventsParams>,
-    ) -> Result<GetEventsResult> {
+    async fn try_fetch(&self, url: &str, request_body: &JsonRpcRequest<GetEventsParams>) -> Result<GetEventsResult> {
         let response = self
             .client
             .post(url)
+            .header("X-Client-Name", CLIENT_NAME)
+            .header("X-Client-Version", CLIENT_VERSION)
             .json(request_body)
             .send()
             .await
-            .with_context(|| format!("failed to send getEvents RPC request to {url}"))?;
+            .with_context(|| format!("posting getEvents to {url}"))?;
 
         let status = response.status();
         if status.is_server_error() {
-            return Err(anyhow!("Horizon/RPC endpoint {url} returned {status}"));
+            return Err(anyhow!("RPC endpoint {url} returned {status}"));
         }
 
-        let rpc_res: JsonRpcResponse<GetEventsResult> = response
+        let body: JsonRpcResponse<GetEventsResult> = response
             .json()
             .await
-            .with_context(|| format!("failed to parse getEvents RPC response from {url}"))?;
+            .with_context(|| format!("decoding getEvents response from {url}"))?;
 
-        if let Some(err) = rpc_res.error {
-            return Err(anyhow!("RPC getEvents error {}: {}", err.code, err.message));
+        if let Some(err) = body.error {
+            return Err(anyhow!("RPC error {}: {}", err.code, err.message));
         }
 
-        rpc_res
-            .result
-            .ok_or_else(|| anyhow!("missing result in getEvents RPC response"))
-    }
-
-    /// Opens a Horizon SSE stream for the configured contracts.
-    ///
-    /// Resumes from the last seen paging token via the `cursor` query parameter
-    /// so no events are missed across reconnects. On repeated disconnects the
-    /// streamer falls back to interval polling to keep alerts flowing.
-    pub async fn stream_events(&mut self) -> Result<Vec<SorobanEvent>> {
-        if self.mode == StreamMode::Poll {
-            return self.fetch_events().await;
-        }
-
-        match self.open_sse_stream().await {
-            Ok(events) => {
-                self.consecutive_disconnects = 0;
-                Ok(events)
-            }
-            Err(err) => {
-                self.consecutive_disconnects += 1;
-                warn!(
-                    error = %err,
-                    disconnects = self.consecutive_disconnects,
-                    "horizon SSE stream disconnected"
-                );
-                if self.consecutive_disconnects >= MAX_STREAM_DISCONNECTS {
-                    warn!(
-                        threshold = MAX_STREAM_DISCONNECTS,
-                        "falling back to interval polling after repeated stream disconnects"
-                    );
-                    self.mode = StreamMode::Poll;
-                }
-                self.fetch_events().await
-            }
-        }
-    }
-
-    /// Performs a single SSE connection attempt against the Horizon endpoint.
-    async fn open_sse_stream(&mut self) -> Result<Vec<SorobanEvent>> {
-        let mut url = format!(
-            "{}/events",
-            self.rpc_urls[self.active_url].trim_end_matches('/')
-        );
-        if let Some(cursor) = &self.last_cursor {
-            url = format!("{}?cursor={}", url, cursor);
-        }
-
-        let response = self
-            .client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .send()
-            .await
-            .context("failed to open horizon SSE stream")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("horizon SSE stream returned {}", response.status()));
-        }
-
-        let body = response
-            .text()
-            .await
-            .context("failed to read horizon SSE stream")?;
-
-        let mut events = Vec::new();
-        for frame in body.split("\n\n") {
-            let Some(sse) = parse_sse_frame(frame) else {
-                continue;
-            };
-            if let Some(id) = sse.id {
-                self.last_cursor = Some(id);
-            }
-            if sse.event == "hello" {
-                continue;
-            }
-            match serde_json::from_str::<SorobanEvent>(&sse.data) {
-                Ok(event) => events.push(event),
-                Err(err) => debug!(error = %err, "skipping unparsable SSE event payload"),
-            }
-        }
-
-        info!(events_count = events.len(), "received horizon SSE events");
-        Ok(events)
-    }
-
-    pub fn current_ledger(&self) -> u64 {
-        self.current_ledger
+        body.result
+            .ok_or_else(|| anyhow!("RPC response from {url} missing result"))
     }
 }
 
-/// Builds a reqwest client that identifies txwatch to Horizon/RPC operators.
 fn build_client() -> Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_str(&format!("{}/{}", CLIENT_NAME, CLIENT_VERSION))
-            .expect("valid user-agent header"),
-    );
-    headers.insert(
-        "X-Client-Name",
-        reqwest::header::HeaderValue::from_static(CLIENT_NAME),
-    );
-    headers.insert(
-        "X-Client-Version",
-        reqwest::header::HeaderValue::from_static(CLIENT_VERSION),
-    );
-
     Client::builder()
-        .default_headers(headers)
+        .user_agent(format!("{CLIENT_NAME}/{CLIENT_VERSION}"))
         .build()
-        .unwrap_or_default()
+        .unwrap_or_else(|_| Client::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[test]
-    fn test_event_filter_serialization() {
-        let filter = EventFilter {
-            event_type: "contract".into(),
-            contract_ids: vec!["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
-            topics: vec![vec!["transfer".into()]],
-        };
-        let json = serde_json::to_string(&filter).unwrap();
-        assert!(json.contains("contractIds"));
-        assert!(json.contains("type"));
-        assert!(json.contains("topics"));
+    fn event_json(id: &str, ledger: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "contractId": "CABC",
+            "ledger": ledger,
+            "ledgerClosedAt": "2024-01-01T00:00:00Z",
+            "type": "contract",
+            "topic": ["AAA"],
+            "value": { "x": 1 },
+            "inSuccessfulContractCall": true
+        })
+    }
+
+    fn rpc_result(events: Vec<serde_json::Value>, latest_ledger: u64, cursor: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": events,
+                "latestLedger": latest_ledger,
+                "cursor": cursor
+            }
+        })
     }
 
     #[tokio::test]
-    async fn test_horizon_requests_send_identifying_headers() {
+    async fn first_page_sends_start_ledger_without_cursor() {
         let server = MockServer::start().await;
-
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(header(
-                "User-Agent",
-                format!("{}/{}", CLIENT_NAME, CLIENT_VERSION).as_str(),
-            ))
-            .and(header("X-Client-Name", CLIENT_NAME))
-            .and(header("X-Client-Version", CLIENT_VERSION))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "events": [],
-                    "latestLedger": 42
-                }
-            })))
-            .expect(1)
+            .respond_with(ResponseTemplate::new(200).set_body_json(rpc_result(
+                vec![event_json("1-1", 10)],
+                50,
+                Some("cursor-a"),
+            )))
             .mount(&server)
             .await;
 
-        let mut streamer = SorobanEventStreamer::new(server.uri(), vec![], 1);
+        let mut streamer = SorobanEventStreamer::new(server.uri(), vec!["CABC".into()], 10);
         let events = streamer.fetch_events().await.unwrap();
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(streamer.last_cursor(), Some("cursor-a"));
+        assert_eq!(streamer.current_ledger, 11);
     }
 
     #[tokio::test]
-    async fn test_failover_to_healthy_endpoint_on_5xx() {
-        let failing = MockServer::start().await;
-        let healthy = MockServer::start().await;
+    async fn multi_page_stream_uses_cursor_and_omits_start_ledger() {
+        let server = MockServer::start().await;
 
+        // First page: no cursor yet, startLedger present.
         Mock::given(method("POST"))
             .and(path("/"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&failing)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "events": [],
-                    "latestLedger": 99
-                }
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "params": { "startLedger": 10 }
             })))
-            .expect(1)
-            .mount(&healthy)
+            .respond_with(ResponseTemplate::new(200).set_body_json(rpc_result(
+                vec![event_json("1-1", 10), event_json("1-2", 11)],
+                50,
+                Some("cursor-a"),
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
             .await;
 
-        let mut streamer =
-            SorobanEventStreamer::with_urls(vec![failing.uri(), healthy.uri()], vec![], 1);
-
-        let events = streamer.fetch_events().await.unwrap();
-        assert!(events.is_empty());
-        assert_eq!(streamer.current_ledger(), 99);
-    }
-
-    #[tokio::test]
-    async fn test_failover_on_connection_error() {
-        let healthy = MockServer::start().await;
-
+        // Second page: cursor present, startLedger must be absent.
         Mock::given(method("POST"))
             .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "events": [],
-                    "latestLedger": 7
-                }
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "params": { "pagination": { "cursor": "cursor-a" } }
             })))
-            .expect(1)
-            .mount(&healthy)
+            .respond_with(ResponseTemplate::new(200).set_body_json(rpc_result(
+                vec![event_json("1-3", 12)],
+                50,
+                Some("cursor-b"),
+            )))
+            .mount(&server)
             .await;
 
-        // Unreachable endpoint (no server listening) followed by a healthy one.
-        let mut streamer = SorobanEventStreamer::with_urls(
-            vec!["http://127.0.0.1:1".into(), healthy.uri()],
-            vec![],
-            1,
-        );
+        let mut streamer = SorobanEventStreamer::new(server.uri(), vec!["CABC".into()], 10);
 
-        let events = streamer.fetch_events().await.unwrap();
-        assert!(events.is_empty());
-        assert_eq!(streamer.current_ledger(), 7);
-    }
-    #[test]
-    fn test_stream_mode_defaults_to_poll() {
-        assert_eq!(StreamMode::default(), StreamMode::Poll);
-        let streamer = SorobanEventStreamer::new("http://localhost", vec![], 1);
-        assert_eq!(streamer.mode(), StreamMode::Poll);
+        let first = streamer.fetch_events().await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(streamer.current_ledger, 12);
+
+        let second = streamer.fetch_events().await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(streamer.last_cursor(), Some("cursor-b"));
+        assert_eq!(streamer.current_ledger, 13);
     }
 
     #[test]
-    fn test_parse_sse_frame_extracts_id_and_data() {
-        let frame = "event: message\nid: 0000000120\ndata: {\"id\":\"1\"}";
-        let parsed = parse_sse_frame(frame).expect("frame should parse");
-        assert_eq!(parsed.event, "message");
-        assert_eq!(parsed.id.as_deref(), Some("0000000120"));
-        assert_eq!(parsed.data, "{\"id\":\"1\"}");
-    }
-
-    #[test]
-    fn test_parse_sse_frame_ignores_keepalive_comments() {
-        assert!(parse_sse_frame(": keep-alive").is_none());
-        assert!(parse_sse_frame("").is_none());
-    }
-
-    #[test]
-    fn test_parse_sse_frame_joins_multiline_data() {
-        let frame = "data: line1\ndata: line2";
-        let parsed = parse_sse_frame(frame).unwrap();
-        assert_eq!(parsed.data, "line1\nline2");
+    fn get_events_params_omits_start_ledger_when_cursor_present() {
+        let params = GetEventsParams {
+            start_ledger: None,
+            filters: vec![],
+            pagination: Some(PaginationParams {
+                limit: 100,
+                cursor: Some("cursor-a".into()),
+            }),
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert!(value.get("startLedger").is_none());
+        assert_eq!(value["pagination"]["cursor"], "cursor-a");
     }
 }

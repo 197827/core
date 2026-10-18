@@ -250,8 +250,8 @@ impl fmt::Display for Network {
 /// Maximum nesting depth for composite rules (All / Any / Not).
 pub const MAX_COMPOSITE_DEPTH: usize = 5;
 
-/// Allowed severity levels for alert rules.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+/// Allowed severity levels for alert rules, ordered from least to most severe.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Info,
@@ -891,6 +891,8 @@ pub enum WebhookFormat {
     Discord,
     /// PagerDuty Events API v2 `trigger` event; requires `routing_key`.
     Pagerduty,
+    /// User-defined body rendered from `template` or `template_file`.
+    Template,
 }
 
 impl WebhookFormat {
@@ -900,6 +902,7 @@ impl WebhookFormat {
             WebhookFormat::Slack => "slack",
             WebhookFormat::Discord => "discord",
             WebhookFormat::Pagerduty => "pagerduty",
+            WebhookFormat::Template => "template",
         }
     }
 }
@@ -965,7 +968,7 @@ fn is_header_value(value: &str) -> bool {
 
 /// One place alerts are delivered to: a `[[contracts.webhooks]]` entry, or
 /// the contract's `webhook_*` shorthand.
-#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookDestination {
     /// http(s) URL the alert is POSTed to.
@@ -974,7 +977,7 @@ pub struct WebhookDestination {
     /// `X-TxWatch-Signature` HMAC. Supports `${ENV_VAR}` interpolation.
     #[serde(default)]
     pub secret: Option<String>,
-    /// Body shape: `txwatch` (default), `slack`, `discord` or `pagerduty`.
+    /// Body shape: `txwatch` (default), `slack`, `discord`, `pagerduty` or `template`.
     #[serde(default)]
     pub format: WebhookFormat,
     /// Extra HTTP headers. Values support `${ENV_VAR}` interpolation.
@@ -984,6 +987,33 @@ pub struct WebhookDestination {
     /// Supports `${ENV_VAR}` interpolation.
     #[serde(default)]
     pub routing_key: Option<String>,
+    /// Body template for `format = "template"` (minijinja syntax; values are
+    /// JSON-escaped). Mutually exclusive with `template_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Path to a file holding the body template; read at config load.
+    /// Supports `${ENV_VAR}` interpolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_file: Option<String>,
+    /// PEM client certificate for mutual TLS; requires `client_key`.
+    /// Supports `${ENV_VAR}` interpolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    /// PEM private key for `client_cert`. Supports `${ENV_VAR}` interpolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+    /// PEM CA certificate trusted for this destination in addition to the
+    /// system roots. Supports `${ENV_VAR}` interpolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+    /// Only deliver alerts at or above this severity. Alerts without a
+    /// severity are skipped when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<Severity>,
+    /// Only deliver alerts whose rule type is listed (e.g. `"LargeTransfer"`).
+    /// Empty (default) delivers every rule type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_types: Vec<String>,
 }
 
 impl fmt::Debug for WebhookDestination {
@@ -994,11 +1024,40 @@ impl fmt::Debug for WebhookDestination {
             .field("format", &self.format)
             .field("headers", &self.headers)
             .field("routing_key", &self.routing_key.as_ref().map(|_| REDACTED))
+            .field("template", &self.template)
+            .field("template_file", &self.template_file)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &self.client_key)
+            .field("ca_cert", &self.ca_cert)
+            .field("min_severity", &self.min_severity)
+            .field("rule_types", &self.rule_types)
             .finish()
     }
 }
 
 impl WebhookDestination {
+    /// Whether an alert with this severity and rule type passes the
+    /// destination's `min_severity` and `rule_types` filters.
+    pub fn accepts(&self, severity: Option<&str>, rule_type: &str) -> bool {
+        if let Some(min) = &self.min_severity {
+            let severity = match severity {
+                Some("info") => Severity::Info,
+                Some("warning") => Severity::Warning,
+                Some("critical") => Severity::Critical,
+                _ => return false,
+            };
+            if severity < *min {
+                return false;
+            }
+        }
+        self.rule_types.is_empty() || self.rule_types.iter().any(|t| t == rule_type)
+    }
+
+    /// Whether this destination needs its own TLS client.
+    pub fn has_tls_config(&self) -> bool {
+        self.client_cert.is_some() || self.client_key.is_some() || self.ca_cert.is_some()
+    }
+
     /// Validates a stand-alone destination (e.g. one built from CLI flags).
     pub fn validate(&self) -> Result<()> {
         ValidationErrors::into_result(self.problems(&|name| name.to_owned()))
@@ -1049,6 +1108,43 @@ impl WebhookDestination {
                 field("routing_key")
             )),
             _ => {}
+        }
+        match (self.format, &self.template) {
+            (WebhookFormat::Template, None) => problems.push(format!(
+                "{} or {} is required when format is \"template\"",
+                field("template"),
+                field("template_file")
+            )),
+            (WebhookFormat::Template, Some(template)) => {
+                let mut env = minijinja::Environment::new();
+                if let Err(e) = env.add_template("body", template) {
+                    problems.push(format!("{} is invalid: {}", field("template"), e));
+                }
+            }
+            (_, Some(_)) => problems.push(format!(
+                "{} is only used when format is \"template\"",
+                field("template")
+            )),
+            _ => {}
+        }
+        if self.client_cert.is_some() != self.client_key.is_some() {
+            problems.push(format!(
+                "{} and {} must be set together",
+                field("client_cert"),
+                field("client_key")
+            ));
+        }
+        if self.has_tls_config() && !self.url.starts_with("https://") {
+            problems.push(format!(
+                "{} must use https when TLS certificates are configured",
+                field("url")
+            ));
+        }
+        if self.rule_types.iter().any(|t| t.trim().is_empty()) {
+            problems.push(format!(
+                "{} may not contain empty entries",
+                field("rule_types")
+            ));
         }
         problems
     }
@@ -1282,6 +1378,7 @@ impl WatchedContract {
                 format: self.webhook_format,
                 headers: self.webhook_headers.clone(),
                 routing_key: self.webhook_routing_key.clone(),
+                ..Default::default()
             });
         }
         destinations.extend(self.webhooks.iter().cloned());
@@ -1567,6 +1664,15 @@ fn is_env_var_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Internal parsers exposed for the fuzz targets in `fuzz/`. Not a public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub fn interpolate(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+        super::interpolate(value, lookup).ok()
+    }
+}
+
 /// Expands environment-variable references anywhere in `value`:
 ///
 /// - `${VAR}` is replaced by the value of `VAR`; an unset variable is an error.
@@ -1670,12 +1776,35 @@ impl AppConfig {
             )?;
             // Each entry of the `webhooks` array is a destination in its own right.
             for (j, destination) in contract.webhooks.iter_mut().enumerate() {
+                let field = |name: &str| format!("contracts[{}].webhooks[{}].{}", i, j, name);
                 resolve_destination(
                     &mut destination.secret,
                     &mut destination.headers,
                     &mut destination.routing_key,
-                    &|name| format!("contracts[{}].webhooks[{}].{}", i, j, name),
+                    &field,
                 )?;
+                for (name, value) in [
+                    ("client_cert", &mut destination.client_cert),
+                    ("client_key", &mut destination.client_key),
+                    ("ca_cert", &mut destination.ca_cert),
+                    ("template_file", &mut destination.template_file),
+                ] {
+                    if let Some(value) = value {
+                        resolve_field(value, &field(name))?;
+                    }
+                }
+                if let Some(path) = &destination.template_file {
+                    if destination.template.is_some() {
+                        bail!(
+                            "{} and {} are mutually exclusive",
+                            field("template"),
+                            field("template_file")
+                        );
+                    }
+                    destination.template = Some(fs::read_to_string(path).with_context(|| {
+                        format!("{}: cannot read '{}'", field("template_file"), path)
+                    })?);
+                }
             }
             if let Network::Custom(custom) = &mut contract.network {
                 resolve_field(&mut custom.horizon_url, &field("network.horizon_url"))?;
@@ -3388,6 +3517,102 @@ mod tests {
     }
 
     #[test]
+    fn destination_filters_apply_min_severity_and_rule_types() {
+        let cfg = parse_contract(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://events.example.com/pd"
+            min_severity = "critical"
+            [[contracts.webhooks]]
+            url = "https://chat.example.com/hook"
+            rule_types = ["LargeTransfer"]
+            "#,
+        )
+        .unwrap();
+        let d = cfg.contracts[0].destinations();
+        assert!(d[0].accepts(Some("critical"), "AnyTransaction"));
+        assert!(!d[0].accepts(Some("warning"), "AnyTransaction"));
+        assert!(!d[0].accepts(None, "AnyTransaction"));
+        assert!(d[1].accepts(None, "LargeTransfer"));
+        assert!(!d[1].accepts(Some("critical"), "AnyTransaction"));
+
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            rule_types = [""]
+            "#,
+        );
+        assert!(
+            err.contains("webhooks[0].rule_types may not contain empty entries"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn template_format_requires_a_valid_template() {
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            format = "template"
+            "#,
+        );
+        assert!(
+            err.contains("webhooks[0].template or webhooks[0].template_file is required"),
+            "got: {}",
+            err
+        );
+
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            format = "template"
+            template = "{\"text\": {{ label }"
+            "#,
+        );
+        assert!(
+            err.contains("webhooks[0].template is invalid"),
+            "got: {}",
+            err
+        );
+
+        let cfg = parse_contract(
+            r#"
+            [[contracts.webhooks]]
+            url = "https://example.com/hook"
+            format = "template"
+            template = "{\"text\": {{ label }}}"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.contracts[0].webhooks[0].format, WebhookFormat::Template);
+    }
+
+    #[test]
+    fn mtls_requires_cert_and_key_together_over_https() {
+        let err = parse_err(
+            r#"
+            [[contracts.webhooks]]
+            url = "http://example.com/hook"
+            client_cert = "/certs/client.pem"
+            "#,
+        );
+        assert!(
+            err.contains("webhooks[0].client_cert and webhooks[0].client_key must be set together"),
+            "got: {}",
+            err
+        );
+        assert!(
+            err.contains("webhooks[0].url must use https"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn pagerduty_requires_a_routing_key_and_others_reject_one() {
         let err = parse_err(
             r#"webhook_url = "https://events.pagerduty.com/v2/enqueue"
@@ -3559,6 +3784,7 @@ mod tests {
                 "Bearer t0ken".to_owned(),
             )])),
             routing_key: Some("R0UT1NG".into()),
+            ..Default::default()
         };
         let debug = format!("{:?}", destination);
         for secret in ["s3cret", "t0ken", "R0UT1NG"] {

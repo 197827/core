@@ -110,7 +110,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_format` | string          | no       | Body shape for `webhook_url`: `txwatch` (default), `slack`, `discord` or `pagerduty`. See [Webhook formats](#webhook-formats). |
 | `webhook_headers` | table          | no       | Extra HTTP headers for `webhook_url`, e.g. `{ "Authorization" = "Bearer ${TOKEN}" }`. See [Custom headers](#custom-headers). |
 | `webhook_routing_key` | string     | no       | PagerDuty integration key; required when `webhook_format = "pagerduty"`, rejected otherwise. Supports interpolation. |
-| `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields). See [Multiple destinations](#multiple-destinations). |
+| `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields), plus `min_severity`, `rule_types`, `template`/`template_file` and `client_cert`/`client_key`/`ca_cert`. See [Multiple destinations](#multiple-destinations). |
 | `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. Supports [environment interpolation](#environment-variable-interpolation). |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `soroban_rpc_url` | string         | no       | Soroban RPC endpoint used to fetch contract events for `EventEmitted` rules. Defaults to `https://soroban-testnet.stellar.org` (testnet), `https://rpc-futurenet.stellar.org` (futurenet) or the custom network's `rpc_url`. Mainnet has no default, so a mainnet contract with an `EventEmitted` rule must set it. |
@@ -154,7 +154,42 @@ webhook_url = "https://internal.example.com/txwatch"   # txwatch JSON, as before
 as set, and header values as `<redacted>`. `validate --check-webhooks` probes every destination,
 and `txwatch test-webhook --contract <label>` sends a test alert to each of them.
 
-> Only secrets, header values and routing keys are interpolated; `url` is used as written.
+> Only secrets, header values, routing keys, `template_file` and TLS file paths are interpolated;
+> `url` is used as written.
+
+#### Per-destination filters
+
+`[[contracts.webhooks]]` entries can limit which alerts they receive, so one contract can page
+PagerDuty only for critical alerts while Slack gets everything:
+
+| Field          | Type             | Description |
+|----------------|------------------|-------------|
+| `min_severity` | string           | `info`, `warning` or `critical`. Only alerts at or above this severity are delivered; alerts whose rule has no `severity` are skipped. |
+| `rule_types`   | array of strings | Only alerts from these rule types (e.g. `["LargeTransfer", "AdminFunctionCalled"]`) are delivered. Empty or omitted delivers every rule type. |
+
+```toml
+  [[contracts.webhooks]]
+  url          = "https://events.pagerduty.com/v2/enqueue"
+  format       = "pagerduty"
+  routing_key  = "${PAGERDUTY_ROUTING_KEY}"
+  min_severity = "critical"
+```
+
+`txwatch validate` shows each destination's filters.
+
+#### Mutual TLS
+
+Destinations that require client certificates set `client_cert` and `client_key` (PEM file paths,
+set together) and, for a private CA, `ca_cert`. The URL must be `https`. Each such destination gets
+its own HTTP client; the paths support `${ENV_VAR}` interpolation.
+
+```toml
+  [[contracts.webhooks]]
+  url         = "https://alerts.internal.example.com/txwatch"
+  client_cert = "/etc/txwatch/client.pem"
+  client_key  = "${TXWATCH_CLIENT_KEY_PATH}"
+  ca_cert     = "/etc/txwatch/internal-ca.pem"
+```
 
 ### Webhook formats
 
@@ -164,6 +199,7 @@ and `txwatch test-webhook --contract <label>` sends a test alert to each of them
 | `slack`     | [Slack incoming webhook](https://api.slack.com/messaging/webhooks) | `text` fallback plus Block Kit `blocks`: rule, label and network; contract, transaction link, amount, fee, functions and time; explorer, Horizon and alert ID. |
 | `discord`   | [Discord webhook](https://discord.com/developers/docs/resources/webhook) | `content` plus one embed (title = rule, linked to the explorer; fields for contract, transaction, amount, fee, functions, Horizon). Mentions are disabled, so a label can never ping `@everyone`. Red for `TransactionFailed` / `AdminFunctionCalled`, blue otherwise. |
 | `pagerduty` | [PagerDuty Events API v2](https://developer.pagerduty.com/docs/events-api-v2/trigger-events/) (`https://events.pagerduty.com/v2/enqueue`) | A `trigger` event with the destination's `routing_key` and `dedup_key` = the alert's `alert_id`, so redelivering the same alert updates one incident instead of opening a new one. Severity: `error` for `TransactionFailed`, `critical` for `AdminFunctionCalled`, `warning` otherwise. The full alert is attached as `payload.custom_details`. |
+| `template`  | Any HTTP endpoint | The destination's `template` (or the contents of `template_file`), rendered with [minijinja](https://docs.rs/minijinja). See [Body templates](#body-templates). |
 
 Example Slack body:
 
@@ -236,6 +272,26 @@ Example PagerDuty body:
 ```
 
 The exact bodies are pinned by snapshot tests in `crates/notifier/src/format.rs`.
+
+### Body templates
+
+`format = "template"` covers receivers without a built-in format (Opsgenie, Telegram, Mattermost,
+internal APIs). Set exactly one of `template` (inline) or `template_file` (a path read at config
+load). Templates are checked for syntax errors when the config is loaded.
+
+Every field of the [webhook payload](#webhook-payload) is available as a variable (`label`,
+`contract_id`, `network`, `rule_type`, `rule_triggered`, `severity`, `transaction_hash`,
+`amount_xlm`, `explorer_link`, `horizon_link`, `timestamp_iso`, `alert_id`, ...). Values are
+JSON-escaped and quoted automatically, so write `{{ label }}`, not `"{{ label }}"`. Referencing an
+unknown variable fails the delivery. The engine is sandboxed: templates cannot read files or make
+network requests.
+
+```toml
+  [[contracts.webhooks]]
+  url      = "https://chat.example.com/hooks/abc"
+  format   = "template"
+  template = '{"text": {{ rule_triggered }}, "contract": {{ label }}, "link": {{ explorer_link }}}'
+```
 
 ### Custom headers
 
