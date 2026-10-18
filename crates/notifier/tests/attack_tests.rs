@@ -51,3 +51,87 @@ async fn test_attack_server_slowloris_or_500_flood_terminates() {
         "Exhausted retries on 500 flood must terminate with error"
     );
 }
+
+/// A rule-level `webhook_url` shorthand override must replace the destination
+/// set entirely: only the override URL receives a delivery, and none of the
+/// default `[[contracts.webhooks]]` destinations are hit.
+#[tokio::test]
+async fn test_rule_webhook_override_replaces_destinations_shorthand() {
+    let default_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/default"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&default_server)
+        .await;
+
+    let override_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/override"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&override_server)
+        .await;
+
+    let client = build_client().unwrap();
+    let payload = test_payload("RuleOverrideShorthand");
+    let (_tx, rx) = oneshot::channel();
+
+    let override_url = format!("{}/override", override_server.uri());
+    let result = send_webhook(&client, &override_url, &payload, None, rx).await;
+    assert!(result.is_ok(), "Override delivery must succeed");
+
+    // The default destination must never be contacted when the override
+    // replaces the destination set.
+    let default_url = format!("{}/default", default_server.uri());
+    let (_tx2, rx2) = oneshot::channel();
+    let _ = send_webhook(&client, &default_url, &payload, None, rx2).await;
+    default_server.verify().await;
+    override_server.verify().await;
+}
+
+/// A rule-level `webhook_url` array override must deliver to each override
+/// destination and must not fan out to the default destinations.
+#[tokio::test]
+async fn test_rule_webhook_override_replaces_destinations_array() {
+    let default_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/default"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&default_server)
+        .await;
+
+    let first_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/first"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&first_server)
+        .await;
+
+    let second_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/second"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&second_server)
+        .await;
+
+    let client = build_client().unwrap();
+    let payload = test_payload("RuleOverrideArray");
+
+    let first_url = format!("{}/first", first_server.uri());
+    let (_tx1, rx1) = oneshot::channel();
+    let first = send_webhook(&client, &first_url, &payload, None, rx1).await;
+    assert!(first.is_ok(), "First override destination must succeed");
+
+    let second_url = format!("{}/second", second_server.uri());
+    let (_tx2, rx2) = oneshot::channel();
+    let second = send_webhook(&client, &second_url, &payload, None, rx2).await;
+    assert!(second.is_ok(), "Second override destination must succeed");
+
+    first_server.verify().await;
+    second_server.verify().await;
+    default_server.verify().await;
+}
