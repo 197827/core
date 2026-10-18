@@ -444,3 +444,33 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 [Apache-2.0](LICENSE)
 
+## Handsoff notes
+
+<!-- handsoff-issue-35 -->
+- #35: HTTP timeouts for Horizon and webhooks are hard-coded to 15 seconds
+
+<!-- handsoff-issue-38 -->
+- #38: startup_log_fields test helper duplicates production logic instead of testing it
+<!-- handsoff-issue-24 -->
+- #24: No way to configure a custom Horizon URL per contract
+
+<!-- handsoff-issue-26 -->
+- #26: Allow a starting cursor or ledger instead of always starting from "now"
+<!-- handsoff-issue-33 -->
+- #33: http_connection_verbose is parsed but never used
+
+<!-- handsoff-issue-34 -->
+- #34: http_tcp_keepalive_secs = 0 does not disable keepalive
+<!-- handsoff-issue-27 -->
+- #27: A corrupt cursor_file silently resets every contract to "now"
+
+<!-- handsoff-issue-28 -->
+- #28: Ctrl-C waits for webhook retries to finish before shutting down
+<!-- handsoff-issue-39 -->
+- #39: Tests sleep in real time for back-offs, slowing the suite by many seconds
+
+<!-- handsoff-issue-41 -->
+- #41: FunctionCalled is case-sensitive while AdminFunctionCalled is case-insensitive
+
+<!-- handsoff-issue-287 -->
+- #287: A Debug Log Message Contains a Long Run of Embedded Spaces
