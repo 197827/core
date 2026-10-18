@@ -4,6 +4,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -19,12 +20,23 @@ pub struct SnapshotMetadata {
 }
 
 /// Configuration and runner for automated Postgres snapshots during continuous testnet operations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PostgresSnapshotRoutine {
     pub database_url: String,
     pub snapshot_directory: PathBuf,
     pub snapshot_interval_cycles: u64,
     pub max_retained_snapshots: usize,
+}
+
+impl fmt::Debug for PostgresSnapshotRoutine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresSnapshotRoutine")
+            .field("database_url", &"<redacted>")
+            .field("snapshot_directory", &self.snapshot_directory)
+            .field("snapshot_interval_cycles", &self.snapshot_interval_cycles)
+            .field("max_retained_snapshots", &self.max_retained_snapshots)
+            .finish()
+    }
 }
 
 impl PostgresSnapshotRoutine {
@@ -112,9 +124,13 @@ impl PostgresSnapshotRoutine {
     }
 
     /// Enforces the retention policy by pruning snapshots beyond `max_retained_snapshots`.
+    ///
+    /// Snapshots are ordered by modification time (oldest first) so that the newest
+    /// snapshots are always retained, regardless of how cycle numbers sort
+    /// lexicographically (e.g. `cycle_10_...` vs `cycle_9_...`).
     fn prune_old_snapshots(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.snapshot_directory) {
-            let mut snapshot_files: Vec<PathBuf> = entries
+            let mut snapshot_files: Vec<(std::time::SystemTime, PathBuf)> = entries
                 .filter_map(|res| res.ok())
                 .map(|e| e.path())
                 .filter(|p| {
@@ -124,12 +140,19 @@ impl PostgresSnapshotRoutine {
                             .map(|s| s.starts_with("txwatch_testnet_snapshot_"))
                             .unwrap_or(false)
                 })
+                .map(|p| {
+                    let mtime = std::fs::metadata(&p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    (mtime, p)
+                })
                 .collect();
 
             if snapshot_files.len() > self.max_retained_snapshots {
-                snapshot_files.sort();
+                // Oldest first; ties broken by path for deterministic ordering.
+                snapshot_files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
                 let excess = snapshot_files.len() - self.max_retained_snapshots;
-                for file_to_delete in snapshot_files.iter().take(excess) {
+                for (_, file_to_delete) in snapshot_files.iter().take(excess) {
                     if let Err(e) = std::fs::remove_file(file_to_delete) {
                         warn!(file = %file_to_delete.display(), error = %e, "failed to prune expired snapshot");
                     } else {
@@ -160,5 +183,55 @@ mod tests {
         assert_eq!(meta.testnet_cycle, 5);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_prune_keeps_newest_snapshots() {
+        let temp_dir = std::env::temp_dir().join("txwatch_snapshots_prune_test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create snapshots with non-zero-padded cycle numbers so lexicographic
+        // ordering would incorrectly place cycle_10 before cycle_9.
+        let cycles = [9u64, 10, 11];
+        let mut paths = Vec::new();
+        for (i, cycle) in cycles.iter().enumerate() {
+            let name = format!(
+                "txwatch_testnet_snapshot_cycle_{}_20240101_00000{}.sql",
+                cycle, i
+            );
+            let path = temp_dir.join(&name);
+            std::fs::write(&path, "snapshot").unwrap();
+            // Stagger modification times so ordering is unambiguous.
+            let mtime = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000 + i as u64);
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(mtime).unwrap();
+            paths.push(path);
+        }
+
+        let routine = PostgresSnapshotRoutine::new("postgres://localhost/txwatch", &temp_dir, 1, 2);
+        routine.prune_old_snapshots();
+
+        // Oldest (cycle 9) should be pruned; newest two retained.
+        assert!(!paths[0].exists(), "oldest snapshot should be pruned");
+        assert!(paths[1].exists(), "newer snapshot should be retained");
+        assert!(paths[2].exists(), "newest snapshot should be retained");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_debug_redacts_database_url() {
+        let routine = PostgresSnapshotRoutine::new(
+            "postgres://user:supersecret@localhost/txwatch",
+            "/tmp/snapshots",
+            5,
+            2,
+        );
+        let debug_output = format!("{:?}", routine);
+        assert!(!debug_output.contains("supersecret"));
+        assert!(!debug_output.contains("postgres://user"));
+        assert!(debug_output.contains("<redacted>"));
     }
 }
