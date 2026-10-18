@@ -60,6 +60,29 @@ async fn test_attack_server_slowloris_or_500_flood_terminates() {
     );
 }
 
+#[tokio::test]
+async fn test_attack_huge_success_body_is_capped() {
+    let server = MockServer::start().await;
+    // A misbehaving receiver streams a very large 2xx body. The notifier must
+    // not read it unbounded into memory; it should cap the read and still
+    // treat the delivery as successful.
+    let huge_body = "A".repeat(8 * 1024 * 1024);
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(huge_body))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let url = format!("{}/hook", server.uri());
+    let payload = test_payload("HugeBodyDefense");
+    let (_tx, rx) = oneshot::channel();
+
+    let result = send_webhook(&client, &url, &payload, Some("secret"), rx).await;
+    assert!(
+        result.is_ok(),
+        "A 2xx with a huge body must still be treated as a successful delivery"
+    );
 /// Records the `contract` field of every span that is entered, keyed by span id.
 #[derive(Clone, Default)]
 struct SpanRecorder {
