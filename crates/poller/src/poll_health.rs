@@ -98,15 +98,36 @@ impl PollHealth {
     }
 
     /// Delay before the next poll: `interval` while healthy, doubling with
-    /// every consecutive failure up to `max(MAX_BACKOFF, interval)`.
+    /// every consecutive failure up to `max(MAX_BACKOFF, interval)`. The
+    /// doubled delay is jittered (decorrelated) so contracts that failed
+    /// together do not retry in lockstep and hammer Horizon on recovery.
     pub(crate) fn backoff_delay(&self, interval: Duration) -> Duration {
         if self.consecutive_failures == 0 {
             return interval;
         }
         let shift = self.consecutive_failures.min(16);
         let cap = MAX_BACKOFF.max(interval);
-        interval.saturating_mul(1 << shift).min(cap)
+        let base = interval.saturating_mul(1 << shift).min(cap);
+        jittered(base, cap)
     }
+}
+
+/// Applies decorrelated jitter to `base`: the result is drawn uniformly from
+/// `[base / 2, base]`, then clamped to `cap`. This keeps the delay within the
+/// same order of magnitude while breaking lockstep retries.
+fn jittered(base: Duration, cap: Duration) -> Duration {
+    let half = base / 2;
+    let span = base.saturating_sub(half);
+    let nanos = span.as_nanos();
+    let offset = if nanos == 0 {
+        0
+    } else {
+        // Cheap pseudo-random source; jitter need not be cryptographic.
+        let mut hasher = DefaultHasher::new();
+        Instant::now().hash(&mut hasher);
+        (hasher.finish() % (nanos as u64 + 1)) as u128
+    };
+    half.saturating_add(Duration::from_nanos(offset as u64)).min(cap)
 }
 
 #[cfg(test)]
@@ -119,12 +140,19 @@ mod tests {
         let mut health = PollHealth::default();
         assert_eq!(health.backoff_delay(interval), interval);
 
-        let mut delays = Vec::new();
-        for _ in 0..8 {
+        // Expected deterministic (un-jittered) upper bounds per failure.
+        let upper = [20u64, 40, 80, 160, 320, 600, 600, 600];
+        for &max in &upper {
             health.record_failure();
-            delays.push(health.backoff_delay(interval).as_secs());
+            let delay = health.backoff_delay(interval).as_secs();
+            // Jitter draws from [max/2, max], never exceeding the cap.
+            assert!(
+                delay >= max / 2 && delay <= max,
+                "delay {delay}s out of bounds [{}, {max}]s",
+                max / 2
+            );
+            assert!(delay <= MAX_BACKOFF.as_secs());
         }
-        assert_eq!(delays, vec![20, 40, 80, 160, 320, 600, 600, 600]);
     }
 
     #[test]
@@ -132,7 +160,8 @@ mod tests {
         let interval = Duration::from_secs(3600);
         let mut health = PollHealth::default();
         health.record_failure();
-        assert_eq!(health.backoff_delay(interval), interval);
+        let delay = health.backoff_delay(interval);
+        assert!(delay >= interval / 2 && delay <= interval);
     }
 
     #[test]
