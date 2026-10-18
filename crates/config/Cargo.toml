@@ -11,6 +11,10 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Exposes internal parsers to the fuzz targets in `fuzz/`. Not a public API.
+fuzzing = []
+
 [dependencies]
 serde   = { workspace = true }
 toml    = { workspace = true }

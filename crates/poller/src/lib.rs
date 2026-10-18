@@ -109,6 +109,27 @@ fn contract_function_name(parameters: &[HorizonParameter]) -> Option<String> {
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 
+/// Internal parsers exposed for the fuzz targets in `fuzz/`. Not a public API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub fn parse_stroops(amount: &str) -> Option<u64> {
+        super::parse_stroops(amount).ok()
+    }
+
+    pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+        super::base64_decode(input)
+    }
+
+    /// Decodes `value` as the base64 XDR of a `Sym` invocation parameter.
+    pub fn contract_function_name(value: &str) -> Option<String> {
+        super::contract_function_name(&[super::HorizonParameter {
+            scv_type: "Sym".to_owned(),
+            value: value.to_owned(),
+        }])
+    }
+}
+
 /// Minimal standard-alphabet base64 decoder, so the poller does not need a
 /// new dependency for the one `ScVal` it decodes. Padding is optional.
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
