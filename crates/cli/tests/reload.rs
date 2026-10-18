@@ -113,3 +113,70 @@ fn watch_reloads_config_on_sighup_and_keeps_old_config_when_invalid() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn watch_reload_keeps_horizon_url_override() {
+    let path = env::temp_dir().join("txwatch_sighup_horizon_override.toml");
+    fs::write(
+        &path,
+        format!("poll_interval_seconds = 10\n{}", contract("Alpha", ALPHA)),
+    )
+    .unwrap();
+
+    let override_url = "http://127.0.0.1:1";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "--horizon-url",
+            override_url,
+            "watch",
+            "--dry-run",
+        ])
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start txwatch");
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    wait_for(&lines, "TxWatch polling engine started");
+
+    // Rewrite the config with an extra contract and reload via SIGHUP.
+    fs::write(
+        &path,
+        format!(
+            "poll_interval_seconds = 10\n{}{}",
+            contract("Alpha", ALPHA),
+            contract("Beta", BETA)
+        ),
+    )
+    .unwrap();
+    sighup(&child);
+    let reloaded = wait_for(&lines, "configuration reloaded");
+    assert!(reloaded.contains("contracts=2"), "{}", reloaded);
+
+    // The override must survive the reload: the reloaded contract must still
+    // point at the sentinel URL rather than the public Horizon.
+    let effective = wait_for(&lines, override_url);
+    assert!(
+        !effective.contains("horizon.stellar.org"),
+        "override dropped on reload: {}",
+        effective
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "watcher must still be running"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -562,13 +562,7 @@ async fn main() -> Result<()> {
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    warn!(error = ?e, "failed to install Ctrl+C handler");
-                    return;
-                }
-                let _ = shutdown_tx.send(true);
-            });
+            spawn_signal_handlers(shutdown_tx);
 
             #[cfg(feature = "metrics")]
             if let Some(addr) = metrics_addr {
@@ -577,7 +571,7 @@ async fn main() -> Result<()> {
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
-            spawn_reload_on_sighup(config_path, reload_tx)?;
+            spawn_reload_on_sighup(config_path, cli.horizon_url.clone(), reload_tx)?;
 
             info!(
                 version = VERSION,
@@ -651,11 +645,75 @@ fn required_config(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Forward SIGINT, SIGTERM and SIGQUIT into `shutdown_tx` so containers and
+/// systemd (`docker stop`, Kubernetes) shut down cleanly. A second SIGINT
+/// forces an immediate exit.
+#[cfg(unix)]
+fn spawn_signal_handlers(shutdown_tx: watch::Sender<bool>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGINT handler");
+            return;
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGTERM handler");
+            return;
+        }
+    };
+    let mut sigquit = match signal(SignalKind::quit()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = ?e, "failed to install SIGQUIT handler");
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        let mut shutting_down = false;
+        loop {
+            let is_sigint = tokio::select! {
+                _ = sigint.recv() => true,
+                _ = sigterm.recv() => false,
+                _ = sigquit.recv() => false,
+            };
+            if shutting_down {
+                if is_sigint {
+                    error!("second SIGINT received — exiting immediately, state may not be flushed");
+                    std::process::exit(130);
+                }
+                continue;
+            }
+            shutting_down = true;
+            info!("shutting down, press Ctrl-C again to force");
+            let _ = shutdown_tx.send(true);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_handlers(shutdown_tx: watch::Sender<bool>) {
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = ?e, "failed to install Ctrl+C handler");
+            return;
+        }
+        info!("shutting down, press Ctrl-C again to force");
+        let _ = shutdown_tx.send(true);
+    });
+}
+
 /// On SIGHUP, re-read and validate the config file and hand it to the poller.
 /// An invalid file is logged and ignored, so the previous config keeps running.
 #[cfg(unix)]
 fn spawn_reload_on_sighup(
     path: PathBuf,
+    horizon_url: Option<String>,
     reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
 ) -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -664,7 +722,7 @@ fn spawn_reload_on_sighup(
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
             info!(path = %path.display(), "SIGHUP received — reloading config");
-            if let Some(cfg) = reload_config(&path) {
+            if let Some(cfg) = reload_config(&path, horizon_url.as_deref()) {
                 if reload_tx.send(cfg).await.is_err() {
                     break;
                 }
@@ -677,15 +735,24 @@ fn spawn_reload_on_sighup(
 #[cfg(not(unix))]
 fn spawn_reload_on_sighup(
     _path: PathBuf,
+    _horizon_url: Option<String>,
     _reload_tx: tokio::sync::mpsc::Sender<AppConfig>,
 ) -> Result<()> {
     Ok(())
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
-fn reload_config(path: &Path) -> Option<AppConfig> {
+fn reload_config(path: &Path, horizon_url: Option<&str>) -> Option<AppConfig> {
     match AppConfig::from_file(path) {
-        Ok(cfg) => Some(cfg),
+        Ok(mut cfg) => {
+            if let Some(url) = horizon_url {
+                let url = url.trim_end_matches('/');
+                for c in &mut cfg.contracts {
+                    c.horizon_base_url_override = Some(url.to_string());
+                }
+            }
+            Some(cfg)
+        }
         Err(e) => {
             error!(error = %format!("{:#}", e), "config reload failed — keeping the previous config");
             None
@@ -712,15 +779,27 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
         .contracts
         .iter()
         .map(|c| {
-            let rules: Vec<_> = c.rules.iter().map(|entry| {
-                let mut obj = serde_json::to_value(&entry.rule)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                let map = obj.as_object_mut().unwrap();
-                if let Some(cooldown) = entry.cooldown_seconds {
-                    map.insert("cooldown_seconds".to_string(), serde_json::json!(cooldown));
-                }
-                serde_json::Value::Object(map.clone())
-            }).collect();
+            let rules: Vec<_> = c
+                .rules
+                .iter()
+                .map(|entry| {
+                    let mut obj = serde_json::to_value(&entry.rule)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(cooldown) = entry.cooldown_seconds {
+                        if let Some(map) = obj.as_object_mut() {
+                            map.insert(
+                                "cooldown_seconds".to_string(),
+                                serde_json::json!(cooldown),
+                            );
+                        }
+                    }
+                    obj
+                })
+                .collect();
+            let horizon_url = c
+                .horizon_base_url_override
+                .as_deref()
+                .unwrap_or_else(|| c.network.horizon_base_url());
             serde_json::json!({
                 "label": c.label,
                 "contract_id": c.contract_id,
@@ -730,12 +809,9 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 "webhook_url": c.webhook_url,
                 "webhook_secret_set": c.webhook_secret.is_some(),
                 "rules": rules,
-                "horizon_url": c.network.horizon_base_url(),
-                "explorer_url": format!("{}/contract/{}", c.network.explorer_base_url().unwrap_or(""), c.contract_id),
-                "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
-                "rules": c.rules,
-                "horizon_url": c.network.horizon_base_url(),
+                "horizon_url": horizon_url,
                 "explorer_url": c.network.explorer_base_url().map(|e| format!("{}/contract/{}", e, c.contract_id)),
+                "webhooks": c.destinations().iter().map(destination_summary_json).collect::<Vec<_>>(),
             })
         })
         .collect();
