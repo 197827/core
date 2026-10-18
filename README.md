@@ -366,9 +366,15 @@ cargo build --release -p txwatch --features metrics
 This serves `GET /metrics` (Prometheus text format), `GET /healthz` (process alive) and
 `GET /readyz` (200 once a poll has succeeded recently, else 503). Exported series include
 `txwatch_transactions_total`, `txwatch_alerts_total` and `txwatch_webhook_failures_total`
-(labelled by `contract` and `network`), Horizon request and webhook delivery latency histograms,
-per-contract freshness gauges and `txwatch_build_info`. Without the feature (the default build),
-the `--metrics-addr` flag doesn't exist.
+(labelled by `contract` and `network`), `txwatch_alerts_suppressed_total`
+(`contract`, `network`, `rule_type`; matches dropped by a cooldown),
+`txwatch_webhook_deliveries_total` (`contract`, `format`, `destination`, `outcome`; `destination`
+is the destination's index, never its URL), the Horizon request latency histogram, the webhook
+delivery latency histogram `txwatch_webhook_delivery_duration_seconds` (`format`, `outcome`;
+buckets up to 60 s), per-contract freshness gauges, `txwatch_ledger_lag` (ledgers behind
+Horizon's latest ledger; a warning is logged above `TXWATCH_LEDGER_LAG_WARN_THRESHOLD`,
+default 720) and `txwatch_build_info`. Series of contracts removed or relabelled by a reload
+are deleted. Without the feature (the default build), the `--metrics-addr` flag doesn't exist.
 
 Library users can call `txwatch_poller::serve_metrics(addr, shutdown)` themselves before
 `run_with_shutdown`, with `txwatch-poller`'s `metrics` feature enabled.
