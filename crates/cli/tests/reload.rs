@@ -1,4 +1,8 @@
 //! SIGHUP config reload for `txwatch watch`. Closes #98.
+//!
+//! SIGHUP is a Unix-only signal (the CLI installs a no-op handler on other
+//! platforms), so this whole test binary is gated to Unix and is skipped on
+//! Windows. macOS is Unix and does run it.
 #![cfg(unix)]
 
 use std::{
@@ -52,7 +56,12 @@ fn sighup(child: &Child) {
 
 #[test]
 fn watch_reloads_config_on_sighup_and_keeps_old_config_when_invalid() {
-    let path = env::temp_dir().join("txwatch_sighup_reload.toml");
+    // Unique per-process file name so concurrent test runs (or a stale file
+    // from a previous run) can't interfere, and so the path is portable.
+    let path = env::temp_dir().join(format!(
+        "txwatch_sighup_reload_{}.toml",
+        std::process::id()
+    ));
     fs::write(
         &path,
         format!("poll_interval_seconds = 10\n{}", contract("Alpha", ALPHA)),
@@ -112,4 +121,5 @@ fn watch_reloads_config_on_sighup_and_keeps_old_config_when_invalid() {
 
     let _ = child.kill();
     let _ = child.wait();
+    let _ = fs::remove_file(&path);
 }
