@@ -5,6 +5,7 @@
 //! - `txwatch_alerts_total{contract,network}`            — alert payloads sent (rules matched)
 //! - `txwatch_alerts_suppressed_total{contract,network,rule_type}` — rule matches dropped by a cooldown
 //! - `txwatch_transactions_skipped_total{contract,network}` — transactions dropped because they could not be enriched
+//! - `txwatch_transactions_degraded_total{contract,network}` — transactions evaluated without operation details (enrichment failed after retries)
 //! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
 //! - `txwatch_event_fetch_failures_total{contract,reason}` — event fetches that failed or were unavailable
 //! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
@@ -74,6 +75,18 @@ fn transactions_skipped_total() -> &'static IntCounterVec {
             CONTRACT_LABELS
         )
         .expect("register txwatch_transactions_skipped_total")
+    })
+}
+
+fn transactions_degraded_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_transactions_degraded_total",
+            "Total transactions evaluated without operation details because enrichment failed after retries, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_transactions_degraded_total")
     })
 }
 
@@ -236,6 +249,14 @@ pub fn inc_transactions(contract: &str, network: &str, n: u64) {
 /// Calling it with `0` creates the series so it is exported before any skip.
 pub fn inc_transactions_skipped(contract: &str, network: &str, n: u64) {
     transactions_skipped_total()
+        .with_label_values(&[contract, network])
+        .inc_by(n);
+}
+
+/// Increment `txwatch_transactions_degraded_total` for a contract by `n`.
+/// Calling it with `0` creates the series so it is exported before any degradation.
+pub fn inc_transactions_degraded(contract: &str, network: &str, n: u64) {
+    transactions_degraded_total()
         .with_label_values(&[contract, network])
         .inc_by(n);
 }

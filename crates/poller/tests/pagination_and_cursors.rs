@@ -212,6 +212,58 @@ async fn legacy_cursor_file_is_migrated_to_network_keys() {
 }
 
 #[tokio::test]
+async fn reload_keeps_cursors_of_temporarily_removed_contracts() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    serve_page(&first, "100", tx_page(101..=101)).await;
+    serve_page(&second, "200", tx_page(201..=201)).await;
+    let file = cursor_file("reload-preserve");
+    let both = format!(
+        "{}{}",
+        contract_toml("first", ID, "testnet"),
+        contract_toml("second", ID, "futurenet")
+    );
+
+    txwatch_poller::run_once(config(&both, &file, &[&first, &second]), true)
+        .await
+        .unwrap();
+    let saved = read_cursors(&file);
+    assert_eq!(
+        saved.get(&format!("testnet:{ID}")).map(String::as_str),
+        Some("101")
+    );
+    assert_eq!(
+        saved.get(&format!("futurenet:{ID}")).map(String::as_str),
+        Some("201")
+    );
+
+    // Reload with only the first contract configured.
+    txwatch_poller::run_once(
+        config(&contract_toml("first", ID, "testnet"), &file, &[&first]),
+        true,
+    )
+    .await
+    .unwrap();
+    let saved = read_cursors(&file);
+    assert_eq!(
+        saved.get(&format!("futurenet:{ID}")).map(String::as_str),
+        Some("201"),
+        "cursor of a removed contract must be preserved"
+    );
+
+    // Re-add the second contract: it must resume from its saved cursor.
+    let second_again = MockServer::start().await;
+    serve_page(&second_again, "201", empty_page()).await;
+    txwatch_poller::run_once(
+        config(&both, &file, &[&first, &second_again]),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(requested_cursors(&second_again).await, vec!["201"]);
+}
+
+#[tokio::test]
 async fn ambiguous_legacy_cursor_starts_from_now_on_every_network() {
     let testnet = MockServer::start().await;
     let futurenet = MockServer::start().await;

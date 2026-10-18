@@ -175,6 +175,10 @@ pub struct EnrichedTransaction {
     /// Contract events emitted by this transaction. Only populated when the
     /// contract has an `EventEmitted` rule (fetched from Soroban RPC).
     pub events: Vec<ContractEvent>,
+    /// `true` when the operations fetch failed, so `function_names` and
+    /// `amount_stroops` may be incomplete. Alerts that still fire carry this
+    /// flag so receivers know the evaluation was degraded.
+    pub enrichment_incomplete: bool,
 }
 
 impl EnrichedTransaction {
@@ -219,7 +223,15 @@ impl EnrichedTransaction {
             memo_type: tx.memo_type,
             operation_count: tx.operation_count,
             events: Vec::new(),
+            enrichment_incomplete: false,
         })
+    }
+
+    /// Mark this transaction as evaluated with incomplete enrichment (the
+    /// operations fetch failed after retries).
+    pub fn with_enrichment_incomplete(mut self, incomplete: bool) -> Self {
+        self.enrichment_incomplete = incomplete;
+        self
     }
 
     /// Attach the contract events emitted by this transaction.
@@ -320,7 +332,14 @@ pub struct AlertPayload {
     /// omitted from the JSON otherwise.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub test: bool,
+    /// `true` when the transaction's operations could not be fetched, so
+    /// `function_names` / `amount_stroops` may be incomplete and rules such as
+    /// `FunctionCalled`, `AdminFunctionCalled` and `LargeTransfer` may have
+    /// missed this transaction. Omitted from the JSON when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enrichment_incomplete: bool,
 }
+=======
 
 /// Deterministic alert ID: the first 32 hex characters (128 bits) of
 /// SHA-256 over `contract_id`, `transaction_hash` and `rule_triggered`.
@@ -518,6 +537,7 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                     matched_events: matched_events(rule, tx),
                     suppressed_count: 0,
                     test: false,
+                    enrichment_incomplete: tx.enrichment_incomplete,
                 }),
                 Ok(false) => None,
                 Err(e) => {
@@ -850,6 +870,7 @@ pub fn check_no_activity(
                 matched_events: vec![],
                 suppressed_count: 0,
                 test: false,
+                enrichment_incomplete: false,
 
                 transaction_hash: synthetic_hash,
                 function_name: None,
@@ -897,6 +918,7 @@ pub fn check_no_activity(
                 matched_events: vec![],
                 suppressed_count: 0,
                 test: false,
+                enrichment_incomplete: false,
 
                 transaction_hash: synthetic_hash,
                 function_name: None,
@@ -1104,6 +1126,7 @@ mod tests {
             memo_type: None,
             operation_count: None,
             events: vec![],
+            enrichment_incomplete: false,
         }
     }
 
@@ -1269,6 +1292,7 @@ mod tests {
             memo_type: None,
             operation_count: None,
             events: vec![],
+            enrichment_incomplete: false,
         };
         tx.successful = false; // satisfies TransactionFailed
 
@@ -1511,6 +1535,7 @@ mod tests {
                 memo_type: None,
                 operation_count: None,
                 events: vec![],
+                enrichment_incomplete: false,
             };
             let rules = vec![entry(AlertRule::AnyTransaction)];
             let ctx = EvalContext {
@@ -1764,6 +1789,7 @@ mod tests {
             matched_events: vec![],
             suppressed_count: 0,
             test: false,
+            enrichment_incomplete: false,
         };
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");
@@ -2156,6 +2182,45 @@ mod tests {
         );
         assert_eq!(obj["resolved"].as_bool(), Some(false));
     }
+
+    // ── Issue #274: enrichment_incomplete flag ───────────────────────────────
+
+    #[test]
+    fn enrichment_incomplete_is_omitted_when_false() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        let value = serde_json::to_value(&payloads[0]).unwrap();
+        assert!(
+            !value
+                .as_object()
+                .unwrap()
+                .contains_key("enrichment_incomplete"),
+            "enrichment_incomplete must be omitted when false"
+        );
+    }
+
+    #[test]
+    fn enrichment_incomplete_is_propagated_to_payload() {
+        let tx = make_tx(true, &[], None).with_enrichment_incomplete(true);
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].enrichment_incomplete);
+        let value = serde_json::to_value(&payloads[0]).unwrap();
+        assert_eq!(value["enrichment_incomplete"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn from_horizon_defaults_enrichment_incomplete_to_false() {
+        let raw = HorizonTransaction {
+            hash: "h1".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            ..Default::default()
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert!(!enriched.enrichment_incomplete);
+    }
 }
 
 // ── Property-based tests (#61) ────────────────────────────────────────────────
@@ -2189,6 +2254,7 @@ mod prop_tests {
             memo_type: None,
             operation_count: None,
             events: vec![],
+            enrichment_incomplete: false,
         }
     }
 
@@ -2497,6 +2563,7 @@ mod suppressor_tests {
             memo_type: None,
             operation_count: None,
             events: vec![],
+            enrichment_incomplete: false,
         };
         let ctx = EvalContext {
             label: "L",
@@ -2594,6 +2661,7 @@ mod suppressor_tests {
             memo_type: None,
             operation_count: None,
             events: vec![],
+            enrichment_incomplete: false,
         }
     }
 
