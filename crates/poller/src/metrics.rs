@@ -3,12 +3,17 @@
 //! Exposes, labelled by `contract` (label) and `network` where noted:
 //! - `txwatch_transactions_total{contract,network}`      — transactions processed
 //! - `txwatch_alerts_total{contract,network}`            — alert payloads sent (rules matched)
+//! - `txwatch_alerts_suppressed_total{contract,network,rule_type}` — rule matches dropped by a cooldown
 //! - `txwatch_transactions_skipped_total{contract,network}` — transactions dropped because they could not be enriched
 //! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
 //! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
-//! - `txwatch_webhook_delivery_duration_seconds`         — webhook delivery latency (incl. retries)
+//! - `txwatch_webhook_deliveries_total{contract,format,destination,outcome}` — webhook deliveries;
+//!   `destination` is the destination's index in the contract's list, never its URL
+//! - `txwatch_webhook_delivery_duration_seconds{format,outcome}` — webhook delivery latency (incl. retries)
 //! - `txwatch_last_successful_poll_timestamp_seconds{contract,network}` — data freshness
 //! - `txwatch_consecutive_poll_failures{contract,network}` — current failure streak
+//! - `txwatch_ledger_lag{contract,network}`              — ledgers between Horizon's latest ledger
+//!   and the last processed transaction (0 when caught up)
 //! - `txwatch_build_info{version,git_sha}`               — always 1
 //!
 //! An optional HTTP server can be started by calling [`serve_metrics`]:
@@ -22,8 +27,8 @@
 
 use anyhow::{Context, Result};
 use prometheus::{
-    register_histogram, register_histogram_vec, register_int_counter_vec, register_int_gauge_vec,
-    Histogram, HistogramVec, IntCounterVec, IntGaugeVec,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, HistogramVec,
+    IntCounterVec, IntGaugeVec,
 };
 use std::{
     net::SocketAddr,
@@ -83,6 +88,18 @@ fn alerts_total() -> &'static IntCounterVec {
     })
 }
 
+fn alerts_suppressed_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_alerts_suppressed_total",
+            "Total rule matches suppressed by a cooldown, per watched contract and rule type",
+            &["contract", "network", "rule_type"]
+        )
+        .expect("register txwatch_alerts_suppressed_total")
+    })
+}
+
 fn webhook_failures_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -107,12 +124,32 @@ fn horizon_request_duration() -> &'static HistogramVec {
     })
 }
 
-fn webhook_delivery_duration() -> &'static Histogram {
-    static H: OnceLock<Histogram> = OnceLock::new();
+fn webhook_deliveries_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_webhook_deliveries_total",
+            "Total webhook deliveries (after retries), per contract, format, destination index and outcome",
+            &["contract", "format", "destination", "outcome"]
+        )
+        .expect("register txwatch_webhook_deliveries_total")
+    })
+}
+
+/// A delivery with retries can take close to a minute, beyond the default
+/// buckets' 10 s ceiling.
+const WEBHOOK_DELIVERY_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0,
+];
+
+fn webhook_delivery_duration() -> &'static HistogramVec {
+    static H: OnceLock<HistogramVec> = OnceLock::new();
     H.get_or_init(|| {
-        register_histogram!(
+        register_histogram_vec!(
             "txwatch_webhook_delivery_duration_seconds",
-            "Duration of webhook deliveries, including retries"
+            "Duration of webhook deliveries, including retries",
+            &["format", "outcome"],
+            WEBHOOK_DELIVERY_BUCKETS.to_vec()
         )
         .expect("register txwatch_webhook_delivery_duration_seconds")
     })
@@ -139,6 +176,18 @@ fn consecutive_poll_failures() -> &'static IntGaugeVec {
             CONTRACT_LABELS
         )
         .expect("register txwatch_consecutive_poll_failures")
+    })
+}
+
+fn ledger_lag() -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "txwatch_ledger_lag",
+            "Ledgers between Horizon's latest ledger and the last processed transaction, per watched contract",
+            CONTRACT_LABELS
+        )
+        .expect("register txwatch_ledger_lag")
     })
 }
 
@@ -185,6 +234,13 @@ pub fn inc_alerts(contract: &str, network: &str, n: u64) {
         .inc_by(n);
 }
 
+/// Increment `txwatch_alerts_suppressed_total` for a contract's rule type by 1.
+pub fn inc_alerts_suppressed(contract: &str, network: &str, rule_type: &str) {
+    alerts_suppressed_total()
+        .with_label_values(&[contract, network, rule_type])
+        .inc();
+}
+
 /// Increment `txwatch_webhook_failures_total` for a contract by 1.
 pub fn inc_webhook_failures(contract: &str, network: &str) {
     webhook_failures_total()
@@ -199,9 +255,41 @@ pub fn observe_horizon_request(network: &str, seconds: f64) {
         .observe(seconds);
 }
 
-/// Record how long one webhook delivery (including retries) took.
-pub fn observe_webhook_delivery(seconds: f64) {
-    webhook_delivery_duration().observe(seconds);
+/// Record one webhook delivery (including retries): count it and its duration.
+/// `destination` is the destination's index, never its URL.
+pub fn record_webhook_delivery(
+    contract: &str,
+    format: &str,
+    destination: &str,
+    success: bool,
+    seconds: f64,
+) {
+    let outcome = if success { "success" } else { "failure" };
+    webhook_deliveries_total()
+        .with_label_values(&[contract, format, destination, outcome])
+        .inc();
+    webhook_delivery_duration()
+        .with_label_values(&[format, outcome])
+        .observe(seconds);
+}
+
+/// Set `txwatch_ledger_lag` for a contract.
+pub fn set_ledger_lag(contract: &str, network: &str, lag: u64) {
+    ledger_lag()
+        .with_label_values(&[contract, network])
+        .set(lag as i64);
+}
+
+/// Delete the per-contract gauges of a contract that is no longer polled, so
+/// freshness alerts stop firing for it.
+pub fn remove_contract(contract: &str, network: &str) {
+    for gauge in [
+        last_successful_poll(),
+        consecutive_poll_failures(),
+        ledger_lag(),
+    ] {
+        let _ = gauge.remove_label_values(&[contract, network]);
+    }
 }
 
 /// Record a successful poll of a contract: freshness timestamp and reset
