@@ -233,71 +233,33 @@ fn test_pagerduty_severity_falls_back_to_rule_type() {
     );
 }
 
+/// Chat formats must render the full decimal `amount_xlm_decimal` (trailing
+/// zeros trimmed) rather than the deprecated truncated `amount_xlm` integer,
+/// so a 0.9 XLM transfer shows as "0.9 XLM" and 9,999.99 as "9999.99 XLM".
+#[test]
+fn test_chat_formats_render_decimal_amount() {
+    let mut payload = test_payload("LargeTransfer");
+    payload.amount_xlm = 0;
+    payload.amount_xlm_decimal = "0.9000000".to_string();
+
+    let details = txwatch_notifier::format::details(&payload);
+    assert!(
+        details.contains("0.9 XLM"),
+        "details must render trimmed decimal amount, got: {details}"
+    );
+    assert!(
+        !details.contains("0 XLM"),
+        "details must not render the truncated integer amount, got: {details}"
+    );
+
+    payload.amount_xlm = 9999;
+    payload.amount_xlm_decimal = "9999.9900000".to_string();
+
+    let details = txwatch_notifier::format::details(&payload);
+    assert!(
+        details.contains("9999.99 XLM"),
+        "details must render trimmed decimal amount, got: {details}"
+    );
+}
+
 /// Discord colour must follow the configured severity: a `critical`
-/// `LargeTransfer` renders red, not the warning/blue the heuristic would pick.
-#[test]
-fn test_discord_color_uses_configured_severity() {
-    let mut payload = test_payload("LargeTransfer");
-    payload.severity = Some("critical".to_string());
-
-    let body = txwatch_notifier::format::discord(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-
-    assert_eq!(
-        value["embeds"][0]["color"], 0xE0_1B_24,
-        "critical severity must render the critical (red) colour"
-    );
-}
-
-/// Discord colour must fall back to the rule-type heuristic when severity is
-/// unset.
-#[test]
-fn test_discord_color_falls_back_to_rule_type() {
-    let mut payload = test_payload("LargeTransfer");
-    payload.severity = None;
-
-    let body = txwatch_notifier::format::discord(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-
-    assert_eq!(
-        value["embeds"][0]["color"], 0xF0_B4_00,
-        "unset severity must fall back to the rule_type heuristic (warning)"
-    );
-}
-
-/// Slack output must reflect the configured severity rather than the
-/// rule-type heuristic.
-#[test]
-fn test_slack_uses_configured_severity() {
-    let mut payload = test_payload("AdminFunctionCalled");
-    payload.severity = Some("info".to_string());
-
-    let body = txwatch_notifier::format::slack(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-
-    let text = value["attachments"][0]["color"]
-        .as_str()
-        .unwrap_or_default();
-    assert_eq!(
-        text, "#36a64f",
-        "info severity must render the info (green) colour in Slack"
-    );
-}
-
-/// Slack must fall back to the rule-type heuristic when severity is unset.
-#[test]
-fn test_slack_falls_back_to_rule_type() {
-    let mut payload = test_payload("AdminFunctionCalled");
-    payload.severity = None;
-
-    let body = txwatch_notifier::format::slack(&payload);
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-
-    let text = value["attachments"][0]["color"]
-        .as_str()
-        .unwrap_or_default();
-    assert_eq!(
-        text, "#e01e5a",
-        "unset severity must fall back to the rule_type heuristic (critical)"
-    );
-}

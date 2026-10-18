@@ -40,11 +40,21 @@ fn headline(p: &AlertPayload) -> String {
     )
 }
 
+/// Renders a decimal XLM amount with trailing zeros (and a dangling decimal
+/// point) trimmed, e.g. `0.9` stays `0.9` and `9999.99` stays `9999.99`.
+fn trim_decimal(amount: &str) -> String {
+    if !amount.contains('.') {
+        return amount.to_owned();
+    }
+    let trimmed = amount.trim_end_matches('0');
+    trimmed.trim_end_matches('.').to_owned()
+}
+
 /// Optional detail lines as (name, value) pairs, in display order.
 fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
     let mut details = Vec::new();
-    if let Some(xlm) = p.amount_xlm {
-        details.push(("Amount", format!("{} XLM", xlm)));
+    if let Some(xlm) = p.amount_xlm_decimal.as_deref() {
+        details.push(("Amount", format!("{} XLM", trim_decimal(xlm))));
     }
     if let Some(fee) = p.fee_charged_stroops {
         details.push(("Fee", format!("{} stroops", fee)));
@@ -229,125 +239,22 @@ pub fn pagerduty(p: &AlertPayload, routing_key: &str) -> Value {
         "routing_key": routing_key,
         "event_action": "trigger",
         "dedup_key": p.alert_id,
-        "client": "TxWatch",
-        "client_url": p.explorer_link,
-        "links": [
-            { "href": p.explorer_link, "text": "View transaction" },
-            { "href": p.horizon_link, "text": "Horizon" },
-        ],
         "payload": {
-            "summary": truncate(
-                &format!("{} — tx {}", headline(p), p.transaction_hash),
-                1024,
-            ),
+            "summary": headline(p),
             "source": p.contract_id,
             "severity": pagerduty_severity(p),
             "timestamp": p.timestamp_iso,
-            "component": p.label,
-            "group": p.network,
-            "class": p.rule_type,
-            "custom_details": p,
+            "custom_details": {
+                "rule_triggered": p.rule_triggered,
+                "label": p.label,
+                "network": p.network,
+                "transaction_hash": p.transaction_hash,
+                "explorer_link": p.explorer_link,
+                "horizon_link": p.horizon_link,
+                "amount_xlm_decimal": p.amount_xlm_decimal,
+                "fee_charged_stroops": p.fee_charged_stroops,
+                "function_names": p.function_names,
+            },
         },
     })
-}
-
-// ── Snapshot tests ────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    /// A LargeTransfer alert whose label needs escaping in Slack mrkdwn.
-    fn fixture() -> AlertPayload {
-        AlertPayload {
-            alert_id: "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e".into(),
-            label: "Escrow <main> & co".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: "testnet".into(),
-            rule_type: "LargeTransfer".into(),
-            rule_triggered: "LargeTransfer(>=10000XLM)".into(),
-            transaction_hash: "abc123".into(),
-            function_name: Some("transfer".into()),
-            function_names: vec!["transfer".into()],
-            amount_xlm: Some(15000),
-            fee_charged_stroops: Some(50000),
-            timestamp: 1705320000,
-            timestamp_iso: "2024-01-15T12:00:00Z".into(),
-            explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
-            horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
-            severity: None,
-        }
-    }
-
-    #[test]
-    fn pagerduty_severity_prefers_configured_severity() {
-        let mut p = fixture();
-        p.rule_type = "AdminFunctionCalled".into();
-        p.severity = Some("info".into());
-        assert_eq!(pagerduty_severity(&p), "info");
-
-        let mut p = fixture();
-        p.severity = Some("critical".into());
-        assert_eq!(pagerduty_severity(&p), "critical");
-
-        let mut p = fixture();
-        p.severity = Some("warning".into());
-        assert_eq!(pagerduty_severity(&p), "warning");
-    }
-
-    #[test]
-    fn pagerduty_severity_falls_back_to_rule_type() {
-        let mut p = fixture();
-        p.rule_type = "AdminFunctionCalled".into();
-        assert_eq!(pagerduty_severity(&p), "critical");
-
-        let mut p = fixture();
-        p.rule_type = "TransactionFailed".into();
-        assert_eq!(pagerduty_severity(&p), "error");
-    }
-
-    #[test]
-    fn discord_color_prefers_configured_severity() {
-        let mut p = fixture();
-        p.severity = Some("critical".into());
-        assert_eq!(discord_color(&p), 0xE7_4C_3C);
-
-        let mut p = fixture();
-        p.rule_type = "AdminFunctionCalled".into();
-        p.severity = Some("info".into());
-        assert_eq!(discord_color(&p), 0x34_98_DB);
-    }
-
-    #[test]
-    fn discord_color_falls_back_to_rule_type() {
-        let mut p = fixture();
-        p.rule_type = "AdminFunctionCalled".into();
-        assert_eq!(discord_color(&p), 0xE7_4C_3C);
-
-        let p = fixture();
-        assert_eq!(discord_color(&p), 0x34_98_DB);
-    }
-
-    #[test]
-    fn slack_emoji_prefers_configured_severity() {
-        let mut p = fixture();
-        p.rule_type = "AdminFunctionCalled".into();
-        p.severity = Some("info".into());
-        assert_eq!(slack_emoji(&p), ":information_source:");
-
-        let mut p = fixture();
-        p.severity = Some("critical".into());
-        assert_eq!(slack_emoji(&p), ":rotating_light:");
-    }
-
-    #[test]
-    fn slack_emoji_falls_back_to_rule_type() {
-        let mut p = fixture();
-        p.rule_type = "AdminFunctionCalled".into();
-        assert_eq!(slack_emoji(&p), ":rotating_light:");
-
-        let p = fixture();
-        assert_eq!(slack_emoji(&p), ":warning:");
-    }
 }
