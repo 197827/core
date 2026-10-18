@@ -62,8 +62,18 @@ struct HorizonOperation {
     /// Present on `payment` operations (string, e.g. "1000.0000000"). On path
     /// payments this is the amount the destination receives.
     amount: Option<String>,
+    /// Present on `payment` operations: the account sending the payment.
+    from: Option<String>,
+    /// Present on `payment` operations: the account receiving the payment.
+    to: Option<String>,
+    /// Present on `create_account` operations: the account funding the new one.
+    funder: Option<String>,
+    /// Present on `create_account` operations: the account being created.
+    account: Option<String>,
     /// Present on `create_account` operations: the native starting balance.
     starting_balance: Option<String>,
+    /// Present on path payment operations: the account sending the payment.
+    source_account: Option<String>,
     /// Present on path payment operations: the amount the source sends.
     source_amount: Option<String>,
     /// Asset of `amount` on path payments (`"native"` for XLM).
@@ -146,6 +156,10 @@ struct AssetBalanceChange {
     change_type: String,
     amount: Option<String>,
     asset_type: Option<String>,
+    /// Account the balance moved from, when Horizon reports it.
+    from: Option<String>,
+    /// Account the balance moved to, when Horizon reports it.
+    to: Option<String>,
 }
 
 /// A Horizon transaction record from the account transactions endpoint.
@@ -1259,11 +1273,17 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
             // Otherwise fall back to a separate /operations fetch.
             let details = if !record.operations.is_empty() {
                 debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
-                extract_soroban_details(record.operations)
+                extract_soroban_details(record.operations.clone(), &contract.contract_id).map(
+                    |mut details| {
+                        details.wasm_upgrade =
+                            detect_wasm_upgrade(&record.operations, &contract.contract_id);
+                        details
+                    },
+                )
             } else {
-                fetch_soroban_details(client, poll_base, &tx_hash).await
+                fetch_soroban_details(client, poll_base, &tx_hash, &contract.contract_id).await
             };
-            let (function_names, amount_stroops) = match details {
+            let details = match details {
                 Ok(details) => details,
                 Err(error) => {
                     warn!(
@@ -1272,14 +1292,19 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                         error = %error,
                         "could not fetch operation details — evaluating rules without them"
                     );
-                    (Vec::new(), None)
+                    SorobanDetails::default()
                 }
             };
+            let amount_stroops = details
+                .contract_transfers
+                .iter()
+                .map(|t| t.stroops)
+                .reduce(|a, b| a.saturating_add(b));
 
             let ledger = record.tx.ledger;
-            let enriched = match EnrichedTransaction::from_horizon(
+            let mut enriched = match EnrichedTransaction::from_horizon(
                 record.tx,
-                function_names,
+                details.function_names,
                 amount_stroops,
                 None,
             ) {
@@ -1293,6 +1318,15 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                     continue;
                 }
             };
+            enriched.contract_transfers = details
+                .contract_transfers
+                .iter()
+                .map(|t| (t.direction.to_string(), t.stroops))
+                .collect();
+            if let Some(upgrade) = details.wasm_upgrade {
+                enriched.old_wasm_hash = upgrade.old_wasm_hash;
+                enriched.new_wasm_hash = upgrade.new_wasm_hash;
+            }
 
             // Track the most recent transaction timestamp for NoActivity evaluation.
             state.last_seen = Some(
@@ -1540,9 +1574,24 @@ pub async fn replay_transaction(
         .await
         .with_context(|| format!("failed to parse Horizon transaction from {}", url))?;
 
-    let (function_names, amount_stroops) = fetch_soroban_details(client, base, tx_hash).await?;
+    let details = fetch_soroban_details(client, base, tx_hash, &contract.contract_id).await?;
+    let amount_stroops = details
+        .contract_transfers
+        .iter()
+        .map(|t| t.stroops)
+        .reduce(|a, b| a.saturating_add(b));
     let ledger = tx.ledger;
-    let mut enriched = EnrichedTransaction::from_horizon(tx, function_names, amount_stroops, None)?;
+    let mut enriched =
+        EnrichedTransaction::from_horizon(tx, details.function_names, amount_stroops, None)?;
+    enriched.contract_transfers = details
+        .contract_transfers
+        .iter()
+        .map(|t| (t.direction.to_string(), t.stroops))
+        .collect();
+    if let Some(upgrade) = details.wasm_upgrade {
+        enriched.old_wasm_hash = upgrade.old_wasm_hash;
+        enriched.new_wasm_hash = upgrade.new_wasm_hash;
+    }
     if contract.needs_events() {
         let events =
             transaction_events(client, contract, tx_hash, ledger, &mut HashMap::new()).await;
@@ -1586,46 +1635,89 @@ fn is_native(asset_type: &Option<String>) -> bool {
     asset_type.as_deref() == Some("native")
 }
 
-/// Native XLM moved by one operation, in stroops, for the operation types that
-/// move value besides `payment`:
+/// One native XLM movement attributed to a specific pair of accounts, as
+/// reported by one operation. `from`/`to` are `None` when Horizon does not
+/// report the counterparty (e.g. a SAC transfer whose `from`/`to` are not
+/// decoded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeTransfer {
+    from: Option<String>,
+    to: Option<String>,
+    stroops: u64,
+}
+
+/// Native XLM movements reported by one operation, each attributed to the
+/// accounts involved:
 ///
-/// - `create_account`: the `starting_balance`;
+/// - `payment`: `from` → `to`;
+/// - `create_account`: `funder` → `account` for the `starting_balance`;
 /// - `path_payment_strict_send` / `path_payment_strict_receive`: the native
 ///   leg — `amount` when the destination asset is native, otherwise
 ///   `source_amount` when the source asset is native (a path payment from XLM
 ///   into another asset). A native-to-native path payment counts once;
 /// - `invoke_host_function`: every native `transfer` in `asset_balance_changes`
-///   (Stellar Asset Contract transfers).
-fn native_stroops_moved(op: &HorizonOperation) -> Result<Option<u64>> {
+///   (Stellar Asset Contract transfers), with its own `from`/`to`.
+fn native_transfers_moved(op: &HorizonOperation) -> Result<Vec<NativeTransfer>> {
+    let mut transfers = Vec::new();
     match op.op_type.as_str() {
-        "create_account" => op
-            .starting_balance
-            .as_deref()
-            .map(parse_stroops)
-            .transpose(),
+        "payment" => {
+            if op.asset_type.as_deref() == Some("native") {
+                if let Some(stroops) = op.amount.as_deref().map(parse_stroops).transpose()? {
+                    transfers.push(NativeTransfer {
+                        from: op.from.clone(),
+                        to: op.to.clone(),
+                        stroops,
+                    });
+                }
+            }
+        }
+        "create_account" => {
+            if let Some(stroops) = op
+                .starting_balance
+                .as_deref()
+                .map(parse_stroops)
+                .transpose()?
+            {
+                transfers.push(NativeTransfer {
+                    from: op.funder.clone(),
+                    to: op.account.clone(),
+                    stroops,
+                });
+            }
+        }
         "path_payment_strict_send" | "path_payment_strict_receive" => {
-            if is_native(&op.asset_type) {
-                op.amount.as_deref().map(parse_stroops).transpose()
+            let stroops = if is_native(&op.asset_type) {
+                op.amount.as_deref().map(parse_stroops).transpose()?
             } else if is_native(&op.source_asset_type) {
-                op.source_amount.as_deref().map(parse_stroops).transpose()
+                op.source_amount.as_deref().map(parse_stroops).transpose()?
             } else {
-                Ok(None)
+                None
+            };
+            if let Some(stroops) = stroops {
+                transfers.push(NativeTransfer {
+                    from: op.source_account.clone(),
+                    to: op.to.clone(),
+                    stroops,
+                });
             }
         }
         "invoke_host_function" => {
-            let mut total: Option<u64> = None;
             for change in op.asset_balance_changes.iter().flatten() {
                 if change.change_type != "transfer" || !is_native(&change.asset_type) {
                     continue;
                 }
                 if let Some(stroops) = change.amount.as_deref().map(parse_stroops).transpose()? {
-                    total = Some(total.unwrap_or(0).saturating_add(stroops));
+                    transfers.push(NativeTransfer {
+                        from: change.from.clone(),
+                        to: change.to.clone(),
+                        stroops,
+                    });
                 }
             }
-            Ok(total)
         }
-        _ => Ok(None),
+        _ => {}
     }
+    Ok(transfers)
 }
 
 /// Extract Soroban details from a slice of already-fetched operations.
@@ -1687,27 +1779,64 @@ fn parse_stroops(amount: &str) -> Result<u64> {
         .with_context(|| format!("malformed amount {:?}: overflows u64 stroops", amount))
 }
 
+/// Soroban details extracted from a transaction's operations.
+#[derive(Debug, Default, Clone)]
+struct SorobanDetails {
+    /// Contract function names invoked by `invoke_host_function` operations.
+    function_names: Vec<String>,
+    /// Native XLM that moved into or out of the watched contract, attributed
+    /// to the contract. Transfers between unrelated parties are not included.
+    contract_transfers: Vec<ContractTransfer>,
+    /// Old and new WASM hashes when the watched contract's executable changed.
+    wasm_upgrade: Option<WasmUpgrade>,
+}
+
+/// One native XLM movement where the watched contract is the sender or the
+/// receiver. `direction` is `"in"` when the contract received the funds and
+/// `"out"` when it sent them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContractTransfer {
+    direction: &'static str,
+    stroops: u64,
+}
+
+/// The watched contract's executable changed during the transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WasmUpgrade {
+    old_wasm_hash: Option<String>,
+    new_wasm_hash: Option<String>,
+}
+
 /// Extract Soroban details from a slice of already-fetched operations.
 ///
-/// Only `payment` operations in the native asset (`asset_type == "native"`)
-/// count towards the returned stroop total; payments in issued assets are not XLM.
-/// A native payment with a malformed amount is an error.
-fn extract_soroban_details(ops: Vec<HorizonOperation>) -> Result<(Vec<String>, Option<u64>)> {
-    let mut function_names: Vec<String> = Vec::new();
-    let mut total_stroops: u64 = 0;
-    let mut has_amount = false;
+/// Native XLM movements are attributed to the accounts involved, and only the
+/// ones where `contract_id` is the sender or the receiver are kept, so
+/// unrelated payments in the same transaction never contribute. A native
+/// payment with a malformed amount is an error.
+fn extract_soroban_details(
+    ops: Vec<HorizonOperation>,
+    contract_id: &str,
+) -> Result<SorobanDetails> {
+    let mut details = SorobanDetails::default();
 
     for op in ops {
-        if let Some(stroops) = native_stroops_moved(&op)? {
-            total_stroops = total_stroops.saturating_add(stroops);
-            has_amount = true;
+        for transfer in native_transfers_moved(&op)? {
+            let direction = match (transfer.from.as_deref(), transfer.to.as_deref()) {
+                (Some(from), _) if from == contract_id => "out",
+                (_, Some(to)) if to == contract_id => "in",
+                _ => continue,
+            };
+            details.contract_transfers.push(ContractTransfer {
+                direction,
+                stroops: transfer.stroops,
+            });
         }
         if op.op_type == "invoke_host_function" {
             // Issue #3: `op.function` is the host function type, so matching
             // against it could never work. The contract function name is the
             // `Sym` argument.
             if let Some(name) = contract_function_name(&op.parameters) {
-                function_names.push(name);
+                details.function_names.push(name);
             } else {
                 debug!(
                     host_function_type = ?op.host_function_type,
@@ -1715,19 +1844,52 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> Result<(Vec<String>, O
                 );
             }
         }
-        if op.op_type == "payment" && op.asset_type.as_deref() == Some("native") {
-            if let Some(amt_str) = op.amount.as_deref() {
-                let stroops = parse_stroops(amt_str).map_err(|e| {
-                    error!(error = %e, "invalid payment amount in Horizon operation");
-                    e
-                })?;
-                total_stroops = total_stroops.saturating_add(stroops);
-                has_amount = true;
-            }
-        }
     }
 
-    Ok((function_names, has_amount.then_some(total_stroops)))
+    Ok(details)
+}
+
+/// Detect a change of the watched contract's executable from the transaction's
+/// operations. A contract can replace its code through any function that calls
+/// `update_current_contract_wasm`, so the upgrade is recognised by the
+/// `update_current_contract_wasm` host function (and the legacy
+/// `upgrade` function name) rather than by the invoked function name alone.
+///
+/// The old and new WASM hashes are taken from the operation's parameters when
+/// Horizon reports them; otherwise only the fact of the upgrade is recorded.
+fn detect_wasm_upgrade(ops: &[HorizonOperation], contract_id: &str) -> Option<WasmUpgrade> {
+    let mut upgrade: Option<WasmUpgrade> = None;
+    for op in ops {
+        if op.op_type != "invoke_host_function" {
+            continue;
+        }
+        let host_fn = op.host_function_type.as_deref().unwrap_or_default();
+        let is_upgrade = host_fn.contains("UpdateCurrentContractWasm")
+            || host_fn.contains("update_current_contract_wasm")
+            || contract_function_name(&op.parameters).as_deref() == Some("upgrade");
+        if !is_upgrade {
+            continue;
+        }
+        // Only attribute the upgrade to the watched contract when the operation
+        // names it; an upgrade of another contract must not fire the rule.
+        let mentions_contract = op
+            .parameters
+            .iter()
+            .any(|p| p.value.contains(contract_id) || p.value == contract_id);
+        if !mentions_contract && !host_fn.contains("UpdateCurrentContractWasm") {
+            continue;
+        }
+        let new_wasm_hash = op
+            .parameters
+            .iter()
+            .find(|p| p.scv_type == "Bytes")
+            .map(|p| p.value.clone());
+        upgrade = Some(WasmUpgrade {
+            old_wasm_hash: None,
+            new_wasm_hash,
+        });
+    }
+    upgrade
 }
 
 fn truncate_response_body(body: &str) -> String {
@@ -1758,7 +1920,8 @@ async fn fetch_soroban_details(
     client: &Client,
     base: &str,
     tx_hash: &str,
-) -> Result<(Vec<String>, Option<u64>)> {
+    contract_id: &str,
+) -> Result<SorobanDetails> {
     let fetches = OPERATION_FETCHES.fetch_add(1, Ordering::Relaxed) + 1;
     debug!(tx = %tx_hash, fallback_operation_fetches = fetches, "fetching operations for transaction");
 
@@ -1793,7 +1956,9 @@ async fn fetch_soroban_details(
         }
     }
 
-    extract_soroban_details(ops)
+    let mut details = extract_soroban_details(ops.clone(), contract_id)?;
+    details.wasm_upgrade = detect_wasm_upgrade(&ops, contract_id);
+    Ok(details)
 }
 
 // ── Soroban contract events ───────────────────────────────────────────────────
@@ -3458,108 +3623,252 @@ mod amount_and_cursor_tests {
         assert!(parse_stroops("99999999999999999999").is_err());
     }
 
+    const ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    fn total(details: &SorobanDetails) -> Option<u64> {
+        details
+            .contract_transfers
+            .iter()
+            .map(|t| t.stroops)
+            .reduce(|a, b| a.saturating_add(b))
+    }
+
     #[test]
     fn payment_operations_still_count() {
-        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
-            { "type": "payment", "asset_type": "native", "amount": "1000.0000000" }
-        ])))
+        let details = extract_soroban_details(
+            ops(serde_json::json!([
+                { "type": "payment", "asset_type": "native", "amount": "1000.0000000",
+                  "from": "GOTHER", "to": ID }
+            ])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(amount, Some(10_000_000_000));
+        assert_eq!(total(&details), Some(10_000_000_000));
+        assert_eq!(details.contract_transfers[0].direction, "in");
     }
 
     #[test]
     fn create_account_counts_starting_balance() {
-        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
-            { "type": "create_account", "starting_balance": "2.5000000" }
-        ])))
+        let details = extract_soroban_details(
+            ops(serde_json::json!([
+                { "type": "create_account", "starting_balance": "2.5000000",
+                  "funder": ID, "account": "GNEW" }
+            ])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(amount, Some(25_000_000));
+        assert_eq!(total(&details), Some(25_000_000));
+        assert_eq!(details.contract_transfers[0].direction, "out");
     }
 
     #[test]
     fn path_payment_counts_the_native_leg() {
         // Destination receives XLM: count `amount`.
-        let (_, to_native) = extract_soroban_details(ops(serde_json::json!([{
-            "type": "path_payment_strict_send",
-            "asset_type": "native", "amount": "10.0000000",
-            "source_asset_type": "credit_alphanum4", "source_amount": "99.0000000"
-        }])))
+        let to_native = extract_soroban_details(
+            ops(serde_json::json!([{
+                "type": "path_payment_strict_send",
+                "asset_type": "native", "amount": "10.0000000",
+                "source_asset_type": "credit_alphanum4", "source_amount": "99.0000000",
+                "source_account": "GOTHER", "to": ID
+            }])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(to_native, Some(100_000_000));
+        assert_eq!(total(&to_native), Some(100_000_000));
 
         // Source sends XLM: count `source_amount`.
-        let (_, from_native) = extract_soroban_details(ops(serde_json::json!([{
-            "type": "path_payment_strict_receive",
-            "asset_type": "credit_alphanum4", "amount": "99.0000000",
-            "source_asset_type": "native", "source_amount": "20.0000000"
-        }])))
+        let from_native = extract_soroban_details(
+            ops(serde_json::json!([{
+                "type": "path_payment_strict_receive",
+                "asset_type": "credit_alphanum4", "amount": "99.0000000",
+                "source_asset_type": "native", "source_amount": "20.0000000",
+                "source_account": ID, "to": "GOTHER"
+            }])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(from_native, Some(200_000_000));
+        assert_eq!(total(&from_native), Some(200_000_000));
 
         // Native on both sides counts once.
-        let (_, both) = extract_soroban_details(ops(serde_json::json!([{
-            "type": "path_payment_strict_send",
-            "asset_type": "native", "amount": "5.0000000",
-            "source_asset_type": "native", "source_amount": "5.1000000"
-        }])))
+        let both = extract_soroban_details(
+            ops(serde_json::json!([{
+                "type": "path_payment_strict_send",
+                "asset_type": "native", "amount": "5.0000000",
+                "source_asset_type": "native", "source_amount": "5.1000000",
+                "source_account": ID, "to": "GOTHER"
+            }])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(both, Some(50_000_000));
+        assert_eq!(total(&both), Some(50_000_000));
     }
 
     #[test]
     fn path_payment_between_non_native_assets_is_ignored() {
-        let (_, amount) = extract_soroban_details(ops(serde_json::json!([{
-            "type": "path_payment_strict_send",
-            "asset_type": "credit_alphanum4", "amount": "10.0000000",
-            "source_asset_type": "credit_alphanum4", "source_amount": "10.0000000"
-        }])))
+        let details = extract_soroban_details(
+            ops(serde_json::json!([{
+                "type": "path_payment_strict_send",
+                "asset_type": "credit_alphanum4", "amount": "10.0000000",
+                "source_asset_type": "credit_alphanum4", "source_amount": "10.0000000",
+                "source_account": ID, "to": ID
+            }])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(amount, None);
+        assert_eq!(total(&details), None);
     }
 
     #[test]
     fn soroban_native_transfers_are_counted_from_asset_balance_changes() {
-        let (functions, amount) = extract_soroban_details(ops(serde_json::json!([{
-            "type": "invoke_host_function",
-            "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
-            "parameters": [{ "type": "Sym", "value": "AAAADwAAAAh3aXRoZHJhdw==" }],
-            "asset_balance_changes": [
-                { "type": "transfer", "asset_type": "native", "amount": "3.0000000" },
-                { "type": "transfer", "asset_type": "native", "amount": "1.5000000" },
-                { "type": "transfer", "asset_type": "credit_alphanum4", "amount": "500.0000000" },
-                { "type": "mint", "asset_type": "native", "amount": "7.0000000" }
-            ]
-        }])))
+        let details = extract_soroban_details(
+            ops(serde_json::json!([{
+                "type": "invoke_host_function",
+                "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+                "parameters": [{ "type": "Sym", "value": "AAAADwAAAAh3aXRoZHJhdw==" }],
+                "asset_balance_changes": [
+                    { "type": "transfer", "asset_type": "native", "amount": "3.0000000",
+                      "from": ID, "to": "GOTHER" },
+                    { "type": "transfer", "asset_type": "native", "amount": "1.5000000",
+                      "from": "GOTHER", "to": ID },
+                    { "type": "transfer", "asset_type": "credit_alphanum4", "amount": "500.0000000",
+                      "from": ID, "to": "GOTHER" },
+                    { "type": "mint", "asset_type": "native", "amount": "7.0000000",
+                      "from": ID, "to": "GOTHER" }
+                ]
+            }])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(functions.len(), 1);
-        assert_eq!(amount, Some(45_000_000));
+        assert_eq!(details.function_names.len(), 1);
+        assert_eq!(total(&details), Some(45_000_000));
+        assert_eq!(details.contract_transfers[0].direction, "out");
+        assert_eq!(details.contract_transfers[1].direction, "in");
     }
 
     #[test]
     fn invoke_host_function_without_balance_changes_has_no_amount() {
-        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
-            { "type": "invoke_host_function", "function": "withdraw" },
-            { "type": "invoke_host_function", "function": "x", "asset_balance_changes": null }
-        ])))
+        let details = extract_soroban_details(
+            ops(serde_json::json!([
+                { "type": "invoke_host_function", "function": "withdraw" },
+                { "type": "invoke_host_function", "function": "x", "asset_balance_changes": null }
+            ])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(amount, None);
+        assert_eq!(total(&details), None);
     }
 
     #[test]
     fn amounts_from_every_operation_type_are_summed() {
-        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
-            { "type": "payment", "asset_type": "native", "amount": "1.0000000" },
-            { "type": "create_account", "starting_balance": "2.0000000" },
-            { "type": "path_payment_strict_send", "asset_type": "native", "amount": "3.0000000" },
-            { "type": "invoke_host_function", "asset_balance_changes": [
-                { "type": "transfer", "asset_type": "native", "amount": "4.0000000" }
-            ] }
-        ])))
+        let details = extract_soroban_details(
+            ops(serde_json::json!([
+                { "type": "payment", "asset_type": "native", "amount": "1.0000000",
+                  "from": "GOTHER", "to": ID },
+                { "type": "create_account", "starting_balance": "2.0000000",
+                  "funder": ID, "account": "GNEW" },
+                { "type": "path_payment_strict_send", "asset_type": "native", "amount": "3.0000000",
+                  "source_account": "GOTHER", "to": ID },
+                { "type": "invoke_host_function", "asset_balance_changes": [
+                    { "type": "transfer", "asset_type": "native", "amount": "4.0000000",
+                      "from": ID, "to": "GOTHER" }
+                ] }
+            ])),
+            ID,
+        )
         .unwrap();
-        assert_eq!(amount, Some(100_000_000));
+        assert_eq!(total(&details), Some(100_000_000));
     }
 
-    const ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    /// Issue #264: payments between unrelated parties must not count towards
+    /// the watched contract's large-transfer total.
+    #[test]
+    fn unrelated_payments_do_not_count() {
+        let details = extract_soroban_details(
+            ops(serde_json::json!([
+                { "type": "payment", "asset_type": "native", "amount": "1000.0000000",
+                  "from": "GALICE", "to": "GBOB" },
+                { "type": "create_account", "starting_balance": "500.0000000",
+                  "funder": "GALICE", "account": "GCAROL" },
+                { "type": "invoke_host_function", "asset_balance_changes": [
+                    { "type": "transfer", "asset_type": "native", "amount": "900.0000000",
+                      "from": "GALICE", "to": "GBOB" }
+                ] }
+            ])),
+            ID,
+        )
+        .unwrap();
+        assert!(details.contract_transfers.is_empty());
+        assert_eq!(total(&details), None);
+    }
+
+    /// Issue #264: only the legs touching the contract are counted, and the
+    /// direction distinguishes inflows from outflows.
+    #[test]
+    fn mixed_transaction_only_counts_contract_legs() {
+        let details = extract_soroban_details(
+            ops(serde_json::json!([
+                { "type": "payment", "asset_type": "native", "amount": "1000.0000000",
+                  "from": "GALICE", "to": "GBOB" },
+                { "type": "payment", "asset_type": "native", "amount": "2.0000000",
+                  "from": "GALICE", "to": ID },
+                { "type": "payment", "asset_type": "native", "amount": "3.0000000",
+                  "from": ID, "to": "GBOB" }
+            ])),
+            ID,
+        )
+        .unwrap();
+        assert_eq!(
+            details.contract_transfers,
+            vec![
+                ContractTransfer { direction: "in", stroops: 20_000_000 },
+                ContractTransfer { direction: "out", stroops: 30_000_000 },
+            ]
+        );
+        assert_eq!(total(&details), Some(50_000_000));
+    }
+
+    /// Issue #265: an upgrade through `update_current_contract_wasm` is
+    /// detected even though the invoked function is not named `upgrade`.
+    #[test]
+    fn wasm_upgrade_is_detected_from_host_function() {
+        let ops = ops(serde_json::json!([{
+            "type": "invoke_host_function",
+            "function": "HostFunctionTypeHostFunctionTypeUpdateCurrentContractWasm",
+            "parameters": [
+                { "type": "Address", "value": ID },
+                { "type": "Bytes", "value": "AAAAAENFV0FTSEhI" }
+            ]
+        }]));
+        let upgrade = detect_wasm_upgrade(&ops, ID).expect("upgrade detected");
+        assert_eq!(upgrade.new_wasm_hash.as_deref(), Some("AAAAAENFV0FTSEhI"));
+    }
+
+    #[test]
+    fn wasm_upgrade_is_detected_from_upgrade_function_name() {
+        let ops = ops(serde_json::json!([{
+            "type": "invoke_host_function",
+            "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+            "parameters": [
+                { "type": "Address", "value": ID },
+                { "type": "Sym", "value": "AAAADwAAAAd1cGdyYWRl" },
+                { "type": "Bytes", "value": "AAAAAENFV0FTSEhI" }
+            ]
+        }]));
+        assert!(detect_wasm_upgrade(&ops, ID).is_some());
+    }
+
+    #[test]
+    fn unrelated_upgrade_does_not_fire() {
+        let ops = ops(serde_json::json!([{
+            "type": "invoke_host_function",
+            "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+            "parameters": [
+                { "type": "Address", "value": "COTHER" },
+                { "type": "Sym", "value": "AAAADwAAAAd1cGdyYWRl" }
+            ]
+        }]));
+        assert!(detect_wasm_upgrade(&ops, ID).is_none());
+    }
 
     fn saved(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries

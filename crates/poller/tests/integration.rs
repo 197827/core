@@ -1408,6 +1408,251 @@ async fn cursor_file_is_persisted_after_a_poll_cycle() {
     let _ = std::fs::remove_file(&cursor_file);
 }
 
+/// Issue #264: `LargeTransfer` must only count balance changes where the
+/// watched contract is `from` or `to`. A transaction that mixes several
+/// unrelated native payments with one transfer involving the contract must
+/// not sum the unrelated legs into a "large transfer".
+#[tokio::test]
+async fn large_transfer_only_counts_transfers_involving_the_contract() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let client = txwatch_notifier::build_client().unwrap();
+    let contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::LargeTransfer {
+            threshold_xlm: 1000,
+            threshold_stroops: 1000 * 10_000_000,
+        }],
+    );
+
+    // Three unrelated 900 XLM payments between other accounts plus a single
+    // 10 XLM payment into the watched contract. Summing every native transfer
+    // would yield 2710 XLM and fire; counting only the contract's legs yields
+    // 10 XLM and must not fire.
+    let ops = vec![
+        helpers::native_payment_op(
+            "GUNRELATED1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "GUNRELATED2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "900.0000000",
+        ),
+        helpers::native_payment_op(
+            "GUNRELATED3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "GUNRELATED4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "900.0000000",
+        ),
+        helpers::native_payment_op(
+            "GUNRELATED5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "GUNRELATED6AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "900.0000000",
+        ),
+        helpers::native_payment_op(
+            "GUNRELATED7AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &contract.contract_id,
+            "10.0000000",
+        ),
+    ];
+
+    let tx = EnrichedTransaction::from_horizon(
+        txwatch_rules::HorizonTransaction {
+            hash: "mixed_tx".into(),
+            created_at: "2024-06-01T10:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            source_account: None,
+            fee_account: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: None,
+            ..Default::default()
+        },
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+
+    let ctx = EvalContext {
+        label: &contract.label,
+        contract_id: &contract.contract_id,
+        network: contract.network.as_str(),
+        horizon_base: "https://horizon-testnet.stellar.org",
+        explorer_base: Some("https://stellar.expert/explorer/testnet"),
+    };
+
+    // The unrelated legs must not be summed into a large transfer.
+    let payloads = evaluate(&ctx, &contract.rules, &tx, Some(&ops));
+    assert!(
+        payloads.is_empty(),
+        "unrelated payments must not trigger LargeTransfer, got {:?}",
+        payloads
+    );
+
+    // A transfer that does involve the contract and exceeds the threshold
+    // must fire, with the amount limited to the contract's own leg.
+    let big_ops = vec![
+        helpers::native_payment_op(
+            "GUNRELATED1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "GUNRELATED2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "900.0000000",
+        ),
+        helpers::native_payment_op(
+            "GUNRELATED7AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &contract.contract_id,
+            "2000.0000000",
+        ),
+    ];
+    let payloads = evaluate(&ctx, &contract.rules, &tx, Some(&big_ops));
+    assert_eq!(payloads.len(), 1, "contract inflow must trigger LargeTransfer");
+    assert_eq!(payloads[0].amount_xlm, Some(2000));
+
+    txwatch_notifier::send_webhook_simple(
+        &client,
+        contract.webhook_url.as_deref().unwrap(),
+        &payloads[0],
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// Issue #264: the `direction` option restricts `LargeTransfer` to inflows or
+/// outflows of the watched contract.
+#[tokio::test]
+async fn large_transfer_respects_direction_option() {
+    let contract = helpers::contract(
+        "https://example.com/hook",
+        vec![AlertRule::LargeTransfer {
+            threshold_xlm: 1000,
+            threshold_stroops: 1000 * 10_000_000,
+            direction: Some(txwatch_config::TransferDirection::In),
+        }],
+    );
+
+    let tx = EnrichedTransaction::from_horizon(
+        txwatch_rules::HorizonTransaction {
+            hash: "dir_tx".into(),
+            created_at: "2024-06-01T10:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            source_account: None,
+            fee_account: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: None,
+            ..Default::default()
+        },
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+
+    let ctx = EvalContext {
+        label: &contract.label,
+        contract_id: &contract.contract_id,
+        network: contract.network.as_str(),
+        horizon_base: "https://horizon-testnet.stellar.org",
+        explorer_base: Some("https://stellar.expert/explorer/testnet"),
+    };
+
+    // Outflow only: direction = "in" must not fire.
+    let outflow = vec![helpers::native_payment_op(
+        &contract.contract_id,
+        "GUNRELATED1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "5000.0000000",
+    )];
+    assert!(
+        evaluate(&ctx, &contract.rules, &tx, Some(&outflow)).is_empty(),
+        "direction=in must ignore outflows"
+    );
+
+    // Inflow: direction = "in" fires.
+    let inflow = vec![helpers::native_payment_op(
+        "GUNRELATED1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        &contract.contract_id,
+        "5000.0000000",
+    )];
+    let payloads = evaluate(&ctx, &contract.rules, &tx, Some(&inflow));
+    assert_eq!(payloads.len(), 1, "direction=in must fire on inflows");
+    assert_eq!(payloads[0].amount_xlm, Some(5000));
+}
+
+/// Issue #265: a contract upgrade through an arbitrary function (not one named
+/// `upgrade`) must fire `ContractUpgraded` with the old and new WASM hashes.
+#[tokio::test]
+async fn contract_upgraded_rule_fires_with_wasm_hashes() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&receiver)
+        .await;
+
+    let client = txwatch_notifier::build_client().unwrap();
+    let contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::ContractUpgraded],
+    );
+
+    let old_wasm = "aa".repeat(32);
+    let new_wasm = "bb".repeat(32);
+
+    let tx = EnrichedTransaction::from_horizon(
+        txwatch_rules::HorizonTransaction {
+            hash: "upgrade_tx".into(),
+            created_at: "2024-06-01T10:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            source_account: None,
+            fee_account: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: None,
+            ..Default::default()
+        },
+        vec!["migrate".into()],
+        None,
+        None,
+    )
+    .unwrap()
+    .with_wasm_upgrade(old_wasm.clone(), new_wasm.clone());
+
+    let payloads = evaluate(
+        &EvalContext {
+            label: &contract.label,
+            contract_id: &contract.contract_id,
+            network: contract.network.as_str(),
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: Some("https://stellar.expert/explorer/testnet"),
+        },
+        &contract.rules,
+        &tx,
+        None,
+    );
+    assert_eq!(payloads.len(), 1, "ContractUpgraded must fire");
+    assert!(payloads[0].rule_triggered.contains("ContractUpgraded"));
+    assert_eq!(payloads[0].old_wasm_hash.as_deref(), Some(old_wasm.as_str()));
+    assert_eq!(payloads[0].new_wasm_hash.as_deref(), Some(new_wasm.as_str()));
+
+    txwatch_notifier::send_webhook_simple(
+        &client,
+        contract.webhook_url.as_deref().unwrap(),
+        &payloads[0],
+        None,
+    )
+    .await
+    .unwrap();
+}
+
 /// Issue #2: Horizon's transaction collection endpoints omit failed
 /// transactions unless `include_failed=true` is passed, which made the
 /// `TransactionFailed` rule unreachable in production. The matcher below only
