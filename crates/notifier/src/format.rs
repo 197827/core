@@ -24,8 +24,15 @@ pub fn render_body(
     format: WebhookFormat,
     payload: &AlertPayload,
     routing_key: Option<&str>,
+    template: Option<&str>,
 ) -> Result<String> {
     let body = match format {
+        WebhookFormat::Template => {
+            return render_template(
+                template.ok_or_else(|| anyhow!("template destinations need a template"))?,
+                payload,
+            )
+        }
         WebhookFormat::Txwatch => serde_json::to_value(payload)?,
         WebhookFormat::Slack => slack(payload),
         WebhookFormat::Discord => discord(payload),
@@ -59,6 +66,17 @@ pub fn render_batch_body(
         }
     };
     Ok(serde_json::to_string(&body)?)
+/// Renders a user-defined body template. Every [`AlertPayload`] field is a
+/// variable, and values are JSON-escaped, so `{"text": {{ label }}}` yields
+/// `{"text": "My Contract"}`. The engine is sandboxed: no file or network access.
+fn render_template(template: &str, payload: &AlertPayload) -> Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.set_auto_escape_callback(|_| minijinja::AutoEscape::Json);
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.add_template("body", template)?;
+    Ok(env
+        .get_template("body")?
+        .render(minijinja::Value::from_serialize(payload))?)
 }
 
 /// One-line summary shared by the chat formats.
@@ -316,6 +334,15 @@ mod tests {
         }
     }
 
+    fn render(format: WebhookFormat, payload: &AlertPayload) -> Value {
+        serde_json::from_str(&render_body(format, payload, Some("R0UT1NGKEY"), None).unwrap())
+            .unwrap()
+    }
+
+    fn snapshot(expected: &str) -> Value {
+        serde_json::from_str(expected).expect("snapshot is valid JSON")
+    }
+
     #[test]
     fn txwatch_batch_is_array_of_payloads() {
         let payloads = vec![fixture(), fixture()];
@@ -357,5 +384,101 @@ mod tests {
     fn pagerduty_batch_requires_routing_key() {
         let payloads = vec![fixture()];
         assert!(render_batch_body(WebhookFormat::Pagerduty, &payloads, None).is_err());
+    fn optional_details_are_omitted_when_absent() {
+        let mut p = fixture();
+        p.amount_xlm = None;
+        p.fee_charged_stroops = None;
+        p.function_name = None;
+        p.function_names.clear();
+
+        let slack = render(WebhookFormat::Slack, &p);
+        let names: Vec<&str> = slack["blocks"][1]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["text"].as_str().unwrap().split('\n').next().unwrap())
+            .collect();
+        assert_eq!(names, ["*Contract*", "*Transaction*", "*Time*"]);
+
+        let discord = render(WebhookFormat::Discord, &p);
+        let names: Vec<&str> = discord["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Contract", "Transaction", "Horizon"]);
+    }
+
+    #[test]
+    fn severity_and_colour_follow_the_rule_type() {
+        let mut p = fixture();
+        for (rule_type, severity, colour) in [
+            ("TransactionFailed", "error", 0xE7_4C_3C),
+            ("AdminFunctionCalled", "critical", 0xE7_4C_3C),
+            ("TestWebhook", "info", 0x34_98_DB),
+            ("AnyTransaction", "warning", 0x34_98_DB),
+        ] {
+            p.rule_type = rule_type.into();
+            assert_eq!(
+                render(WebhookFormat::Pagerduty, &p)["payload"]["severity"],
+                severity
+            );
+            assert_eq!(
+                render(WebhookFormat::Discord, &p)["embeds"][0]["color"],
+                colour
+            );
+        }
+    }
+
+    #[test]
+    fn template_renders_payload_variables_with_json_escaping() {
+        let mut p = fixture();
+        p.label = "Quote \" and \\ backslash".into();
+        let body = render_body(
+            WebhookFormat::Template,
+            &p,
+            None,
+            Some(r#"{"text": {{ label }}, "tx": {{ transaction_hash }}}"#),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["text"], p.label);
+        assert_eq!(v["tx"], p.transaction_hash);
+    }
+
+    #[test]
+    fn template_rejects_unknown_variables() {
+        let err = render_body(
+            WebhookFormat::Template,
+            &fixture(),
+            None,
+            Some("{{ nope }}"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("undefined"), "got: {}", err);
+    }
+
+    #[test]
+    fn pagerduty_requires_a_routing_key() {
+        let err = render_body(WebhookFormat::Pagerduty, &fixture(), None, None).unwrap_err();
+        assert!(err.to_string().contains("routing_key"), "got: {}", err);
+    }
+
+    #[test]
+    fn long_text_is_truncated_to_provider_limits() {
+        let mut p = fixture();
+        p.rule_triggered = "x".repeat(300);
+        let discord = render(WebhookFormat::Discord, &p);
+        let title = discord["embeds"][0]["title"].as_str().unwrap();
+        assert_eq!(title.chars().count(), 256);
+        assert!(title.ends_with('\u{2026}'));
+
+        p.label = "y".repeat(2000);
+        let pd = render(WebhookFormat::Pagerduty, &p);
+        assert_eq!(
+            pd["payload"]["summary"].as_str().unwrap().chars().count(),
+            1024
+        );
     }
 }
