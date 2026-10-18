@@ -19,8 +19,15 @@ pub fn render_body(
     format: WebhookFormat,
     payload: &AlertPayload,
     routing_key: Option<&str>,
+    template: Option<&str>,
 ) -> Result<String> {
     let body = match format {
+        WebhookFormat::Template => {
+            return render_template(
+                template.ok_or_else(|| anyhow!("template destinations need a template"))?,
+                payload,
+            )
+        }
         WebhookFormat::Txwatch => serde_json::to_value(payload)?,
         WebhookFormat::Slack => slack(payload),
         WebhookFormat::Discord => discord(payload),
@@ -30,6 +37,19 @@ pub fn render_body(
         ),
     };
     Ok(serde_json::to_string(&body)?)
+}
+
+/// Renders a user-defined body template. Every [`AlertPayload`] field is a
+/// variable, and values are JSON-escaped, so `{"text": {{ label }}}` yields
+/// `{"text": "My Contract"}`. The engine is sandboxed: no file or network access.
+fn render_template(template: &str, payload: &AlertPayload) -> Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.set_auto_escape_callback(|_| minijinja::AutoEscape::Json);
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.add_template("body", template)?;
+    Ok(env
+        .get_template("body")?
+        .render(minijinja::Value::from_serialize(payload))?)
 }
 
 /// One-line summary shared by the chat formats.
@@ -252,7 +272,8 @@ mod tests {
     }
 
     fn render(format: WebhookFormat, payload: &AlertPayload) -> Value {
-        serde_json::from_str(&render_body(format, payload, Some("R0UT1NGKEY")).unwrap()).unwrap()
+        serde_json::from_str(&render_body(format, payload, Some("R0UT1NGKEY"), None).unwrap())
+            .unwrap()
     }
 
     fn snapshot(expected: &str) -> Value {
@@ -420,8 +441,36 @@ mod tests {
     }
 
     #[test]
+    fn template_renders_payload_variables_with_json_escaping() {
+        let mut p = fixture();
+        p.label = "Quote \" and \\ backslash".into();
+        let body = render_body(
+            WebhookFormat::Template,
+            &p,
+            None,
+            Some(r#"{"text": {{ label }}, "tx": {{ transaction_hash }}}"#),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["text"], p.label);
+        assert_eq!(v["tx"], p.transaction_hash);
+    }
+
+    #[test]
+    fn template_rejects_unknown_variables() {
+        let err = render_body(
+            WebhookFormat::Template,
+            &fixture(),
+            None,
+            Some("{{ nope }}"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("undefined"), "got: {}", err);
+    }
+
+    #[test]
     fn pagerduty_requires_a_routing_key() {
-        let err = render_body(WebhookFormat::Pagerduty, &fixture(), None).unwrap_err();
+        let err = render_body(WebhookFormat::Pagerduty, &fixture(), None, None).unwrap_err();
         assert!(err.to_string().contains("routing_key"), "got: {}", err);
     }
 
