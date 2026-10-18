@@ -148,13 +148,24 @@ jobs:
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
   msrv:
-    name: MSRV (1.88)
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
+      # Read the MSRV from Cargo.toml so the job name and toolchain cannot drift.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].rust_version')
+          echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $msrv"
+
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.120
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.toolchain }}
 
       - name: Check workspace builds on the MSRV
         run: cargo check --workspace --all-targets --locked

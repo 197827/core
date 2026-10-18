@@ -12,6 +12,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The ref on dtolnay/rust-toolchain selects the Rust toolchain version,
+      # not the action version. Bumping it breaks the MSRV job.
+      - dependency-name: dtolnay/rust-toolchain
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
 
   - package-ecosystem: docker
     directory: /
