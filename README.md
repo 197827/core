@@ -468,3 +468,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- handsoff-issue-41 -->
 - #41: FunctionCalled is case-sensitive while AdminFunctionCalled is case-insensitive
+
+<!-- handsoff-issue-285 -->
+- #285: Contract Events Cost One `getEvents` Call per Ledger
