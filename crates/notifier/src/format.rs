@@ -87,11 +87,21 @@ fn headline(p: &AlertPayload) -> String {
     )
 }
 
+/// Renders a decimal XLM amount with trailing zeros (and a dangling decimal
+/// point) trimmed, e.g. `0.9` stays `0.9` and `9999.99` stays `9999.99`.
+fn trim_decimal(amount: &str) -> String {
+    if !amount.contains('.') {
+        return amount.to_owned();
+    }
+    let trimmed = amount.trim_end_matches('0');
+    trimmed.trim_end_matches('.').to_owned()
+}
+
 /// Optional detail lines as (name, value) pairs, in display order.
 fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
     let mut details = Vec::new();
-    if let Some(xlm) = p.amount_xlm {
-        details.push(("Amount", format!("{} XLM", xlm)));
+    if let Some(xlm) = p.amount_xlm_decimal.as_deref() {
+        details.push(("Amount", format!("{} XLM", trim_decimal(xlm))));
     }
     if let Some(fee) = p.fee_charged_stroops {
         details.push(("Fee", format!("{} stroops", fee)));
@@ -112,6 +122,22 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Normalises the configured rule severity to one of `info`, `warning`,
+/// `critical`. Returns `None` when the payload carries no severity so callers
+/// can fall back to the rule-type heuristic.
+fn configured_severity(p: &AlertPayload) -> Option<&'static str> {
+    let raw = p.severity.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.to_ascii_lowercase().as_str() {
+        "info" => Some("info"),
+        "warning" | "warn" => Some("warning"),
+        "critical" | "error" => Some("critical"),
+        _ => None,
+    }
+}
+
 // ── Slack ─────────────────────────────────────────────────────────────────────
 
 /// Escapes the three characters Slack mrkdwn treats as control characters.
@@ -119,6 +145,21 @@ fn slack_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Severity emoji for the Slack headline: configured severity wins, falling
+/// back to the rule-type heuristic when unset.
+fn slack_emoji(p: &AlertPayload) -> &'static str {
+    match configured_severity(p) {
+        Some("info") => ":information_source:",
+        Some("warning") => ":warning:",
+        Some("critical") => ":rotating_light:",
+        _ => match p.rule_type.as_str() {
+            "TransactionFailed" | "AdminFunctionCalled" => ":rotating_light:",
+            "TestWebhook" => ":information_source:",
+            _ => ":warning:",
+        },
+    }
 }
 
 /// Slack incoming-webhook message.
@@ -146,7 +187,8 @@ pub fn slack(p: &AlertPayload) -> Value {
                 "text": {
                     "type": "mrkdwn",
                     "text": format!(
-                        "*{}* on *{}* ({})",
+                        "{} *{}* on *{}* ({})",
+                        slack_emoji(p),
                         slack_escape(&p.rule_triggered),
                         slack_escape(&p.label),
                         slack_escape(&p.network)
@@ -199,11 +241,17 @@ pub fn slack_digest(payloads: &[AlertPayload]) -> Value {
 
 // ── Discord ───────────────────────────────────────────────────────────────────
 
-/// Embed colour: red for failures and admin calls, blue otherwise.
-fn discord_color(rule_type: &str) -> u32 {
-    match rule_type {
-        "TransactionFailed" | "AdminFunctionCalled" => 0xE7_4C_3C,
-        _ => 0x34_98_DB,
+/// Embed colour: configured severity wins (info→blue, warning→amber,
+/// critical→red), falling back to the rule-type heuristic when unset.
+fn discord_color(p: &AlertPayload) -> u32 {
+    match configured_severity(p) {
+        Some("info") => 0x34_98_DB,
+        Some("warning") => 0xF1_C4_0F,
+        Some("critical") => 0xE7_4C_3C,
+        _ => match p.rule_type.as_str() {
+            "TransactionFailed" | "AdminFunctionCalled" => 0xE7_4C_3C,
+            _ => 0x34_98_DB,
+        },
     }
 }
 
@@ -234,7 +282,7 @@ pub fn discord(p: &AlertPayload) -> Value {
             "title": truncate(&p.rule_triggered, 256),
             "url": p.explorer_link,
             "description": truncate(&format!("{} ({})", p.label, p.network), 4096),
-            "color": discord_color(&p.rule_type),
+            "color": discord_color(p),
             "timestamp": p.timestamp_iso,
             "fields": fields,
             "footer": { "text": format!("TxWatch · alert {}", p.alert_id) },
@@ -266,10 +314,15 @@ pub fn discord_digest(payloads: &[AlertPayload]) -> Value {
 
 // ── PagerDuty ─────────────────────────────────────────────────────────────────
 
-/// PagerDuty severity: failed transactions are `error`, admin calls
-/// `critical`, test webhooks `info`, everything else `warning`.
-fn pagerduty_severity(rule_type: &str) -> &'static str {
-    match rule_type {
+/// PagerDuty severity: the configured rule severity wins (info→info,
+/// warning→warning, critical→critical); otherwise fall back to the rule-type
+/// heuristic (failed transactions `error`, admin calls `critical`, test
+/// webhooks `info`, everything else `warning`).
+fn pagerduty_severity(p: &AlertPayload) -> &'static str {
+    if let Some(severity) = configured_severity(p) {
+        return severity;
+    }
+    match p.rule_type.as_str() {
         "TransactionFailed" => "error",
         "AdminFunctionCalled" => "critical",
         "TestWebhook" => "info",
@@ -284,24 +337,22 @@ pub fn pagerduty(p: &AlertPayload, routing_key: &str) -> Value {
         "routing_key": routing_key,
         "event_action": "trigger",
         "dedup_key": p.alert_id,
-        "client": "TxWatch",
-        "client_url": p.explorer_link,
-        "links": [
-            { "href": p.explorer_link, "text": "View transaction" },
-            { "href": p.horizon_link, "text": "Horizon" },
-        ],
         "payload": {
-            "summary": truncate(
-                &format!("{} — tx {}", headline(p), p.transaction_hash),
-                1024,
-            ),
+            "summary": headline(p),
             "source": p.contract_id,
-            "severity": pagerduty_severity(&p.rule_type),
+            "severity": pagerduty_severity(p),
             "timestamp": p.timestamp_iso,
-            "component": p.label,
-            "group": p.network,
-            "class": p.rule_type,
-            "custom_details": p,
+            "custom_details": {
+                "rule_triggered": p.rule_triggered,
+                "label": p.label,
+                "network": p.network,
+                "transaction_hash": p.transaction_hash,
+                "explorer_link": p.explorer_link,
+                "horizon_link": p.horizon_link,
+                "amount_xlm_decimal": p.amount_xlm_decimal,
+                "fee_charged_stroops": p.fee_charged_stroops,
+                "function_names": p.function_names,
+            },
         },
     })
 }
