@@ -46,7 +46,7 @@ struct Cli {
     log_format: LogFormat,
 
     /// Override the Horizon base URL for every contract (e.g. a private Horizon instance)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_horizon_url)]
     horizon_url: Option<String>,
 
     #[command(subcommand)]
@@ -63,6 +63,27 @@ enum LogFormat {
 enum OutputFormat {
     Text,
     Json,
+}
+
+/// Network names accepted by `test-webhook --network`. `public` and `pubnet`
+/// are the names Stellar Expert uses for mainnet.
+#[derive(Clone, Copy, ValueEnum)]
+enum NetworkArg {
+    Mainnet,
+    #[value(alias = "public", alias = "pubnet")]
+    MainnetAlias,
+    Testnet,
+    Futurenet,
+}
+
+impl NetworkArg {
+    fn to_network(self) -> txwatch_config::Network {
+        match self {
+            NetworkArg::Mainnet | NetworkArg::MainnetAlias => txwatch_config::Network::Mainnet,
+            NetworkArg::Testnet => txwatch_config::Network::Testnet,
+            NetworkArg::Futurenet => txwatch_config::Network::Futurenet,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -114,8 +135,17 @@ enum Command {
         #[arg(long, default_value = "TxWatch Test")]
         label: String,
 
-        #[arg(long, default_value = "testnet")]
-        network: String,
+        /// Stellar network for the test payload
+        #[arg(long, value_enum, default_value = "testnet")]
+        network: NetworkArg,
+
+        /// Horizon base URL for a custom network in the test payload
+        #[arg(long, value_parser = parse_horizon_url)]
+        horizon_url: Option<String>,
+
+        /// Explorer base URL for a custom network in the test payload
+        #[arg(long, value_parser = parse_horizon_url)]
+        explorer_url: Option<String>,
 
         /// Send to every destination of this configured contract instead of --url
         #[arg(long)]
@@ -254,7 +284,7 @@ async fn main() -> Result<()> {
                 for entry in &c.rules {
                     println!("      - {}", entry.rule.label());
                 }
-                println!("    horizon      : {}", c.network.horizon_base_url());
+                println!("    horizon      : {}", poll_base_url(c));
                 match c.network.explorer_base_url() {
                     Some(explorer) => {
                         println!("    explorer     : {}/contract/{}", explorer, c.contract_id)
@@ -340,6 +370,8 @@ async fn main() -> Result<()> {
             url,
             label,
             network,
+            horizon_url,
+            explorer_url,
             contract,
             secret,
             format,
@@ -350,29 +382,27 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|wanted| {
                     let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
-                    cfg.contracts
-                        .into_iter()
-                        .find(|c| c.label == *wanted)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("configured contract '{}' not found", wanted)
-                        })
+                    find_contract_by_label(&cfg, wanted)
                 })
                 .transpose()?;
-            let (destinations, network) = if let Some(c) = configured {
+            let (destinations, network, horizon, explorer) = if let Some(c) = configured {
                 let mut destinations = c.destinations();
                 if secret.is_some() {
                     for destination in &mut destinations {
                         destination.secret = secret.clone();
                     }
                 }
-                (destinations, c.network)
+                let horizon = poll_base_url(&c).to_string();
+                let explorer = c.network.explorer_base_url().map(str::to_string);
+                (destinations, c.network, horizon, explorer)
             } else {
-                let selected = match network.as_str() {
-                    "mainnet" => txwatch_config::Network::Mainnet,
-                    "testnet" => txwatch_config::Network::Testnet,
-                    "futurenet" => txwatch_config::Network::Futurenet,
-                    other => return Err(anyhow::anyhow!("unknown network '{}'", other)),
-                };
+                let selected = network.to_network();
+                let horizon = horizon_url
+                    .clone()
+                    .unwrap_or_else(|| selected.horizon_base_url().to_string());
+                let explorer = explorer_url
+                    .clone()
+                    .or_else(|| selected.explorer_base_url().map(str::to_string));
                 let destination = WebhookDestination {
                     url: url.ok_or_else(|| {
                         anyhow::anyhow!("--url is required unless --contract is provided")
@@ -384,7 +414,7 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 };
                 destination.validate()?;
-                (vec![destination], selected)
+                (vec![destination], selected, horizon, explorer)
             };
             let client = build_client().context("failed to build HTTP client")?;
 
@@ -394,8 +424,8 @@ async fn main() -> Result<()> {
                 let payload = test_payload_with_network(
                     &label,
                     network.as_str(),
-                    network.horizon_base_url(),
-                    network.explorer_base_url(),
+                    &horizon,
+                    explorer.as_deref(),
                 );
                 info!(url = %destination.url, format = %destination.format, "sending test webhook");
                 match send_to_destination_simple(&client, destination, &payload).await {
@@ -475,11 +505,7 @@ async fn main() -> Result<()> {
             send,
         } => {
             let cfg = load_config(&cli)?;
-            let contract = cfg
-                .contracts
-                .into_iter()
-                .find(|c| c.label == *contract)
-                .ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", contract))?;
+            let contract = find_contract_by_label(&cfg, contract)?;
             let client = build_client().context("failed to build HTTP client")?;
 
             let payloads = txwatch_poller::replay_transaction(&client, &contract, tx).await?;
@@ -705,6 +731,57 @@ fn load_config(cli: &Cli) -> Result<AppConfig> {
     Ok(cfg)
 }
 
+/// The Horizon base URL actually used to poll `contract`: the per-contract
+/// override (including `--horizon-url`) when set, otherwise the network default.
+fn poll_base_url(contract: &txwatch_config::WatchedContract) -> &str {
+    contract
+        .horizon_base_url_override
+        .as_deref()
+        .unwrap_or_else(|| contract.network.horizon_base_url())
+}
+
+/// Find a configured contract by label, matching case-insensitively after
+/// trimming (config validation treats such labels as duplicates). On a miss the
+/// error lists the configured labels.
+fn find_contract_by_label(
+    cfg: &AppConfig,
+    wanted: &str,
+) -> Result<txwatch_config::WatchedContract> {
+    let wanted = wanted.trim();
+    cfg.contracts
+        .iter()
+        .find(|c| c.label.trim().eq_ignore_ascii_case(wanted))
+        .cloned()
+        .ok_or_else(|| {
+            let labels: Vec<&str> = cfg.contracts.iter().map(|c| c.label.as_str()).collect();
+            if labels.is_empty() {
+                anyhow::anyhow!(
+                    "configured contract '{}' not found (no contracts are configured)",
+                    wanted
+                )
+            } else {
+                anyhow::anyhow!(
+                    "configured contract '{}' not found; configured labels: {}",
+                    wanted,
+                    labels.join(", ")
+                )
+            }
+        })
+}
+
+/// Validate a `--horizon-url` / `--explorer-url` value: it must be an absolute
+/// http(s) URL. Trailing slashes are trimmed so the stored value is canonical.
+fn parse_horizon_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("URL must not be empty".to_string());
+    }
+    if let Err(e) = txwatch_config::check_http_url(trimmed) {
+        return Err(format!("invalid URL '{}': {:#}", value, e));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Machine-readable `validate` summary. Webhook secrets are never printed;
 /// only whether one is set.
 fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
@@ -862,10 +939,7 @@ async fn check_horizon_contract(
     client: &Client,
     contract: &txwatch_config::WatchedContract,
 ) -> HorizonCheck {
-    let base = contract
-        .horizon_base_url_override
-        .as_deref()
-        .unwrap_or_else(|| contract.network.horizon_base_url());
+    let base = poll_base_url(contract);
     let root = client.get(base).send().await;
     let (reachable, latest_ledger) = match root {
         Ok(response) if response.status().is_success() => {
