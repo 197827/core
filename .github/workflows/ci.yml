@@ -111,6 +111,30 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # ── Docs ────────────────────────────────────────────────────────────────────
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-doc-
+
+      - name: Build docs and deny warnings
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
   # ── Tests ───────────────────────────────────────────────────────────────────
   test:
     name: Tests (${{ matrix.os }})
@@ -161,13 +185,24 @@ jobs:
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
   msrv:
-    name: MSRV (1.88)
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
+      # Read the MSRV from Cargo.toml so the job name and toolchain cannot drift.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].rust_version')
+          echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $msrv"
+
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.120
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.toolchain }}
 
       - name: Check workspace builds on the MSRV
         run: cargo check --workspace --all-targets --locked

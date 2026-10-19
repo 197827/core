@@ -7,14 +7,24 @@
 # address in config/local.toml, then reload TxWatch without restarting:
 #
 #   docker compose -f docker-compose.local.yml kill -s HUP txwatch
+#
+# Images are pinned by tag and digest. To bump, update both the tag and the
+# digest here (and in docker-compose.yml); Dependabot's docker ecosystem is
+# configured to watch this directory.
 
 services:
   stellar:
-    image: stellar/quickstart:latest
+    image: stellar/quickstart:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
     container_name: stellar-local
     command: --local
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
     networks:
       - txwatch
 
@@ -23,18 +33,21 @@ services:
     container_name: txwatch-local
     volumes:
       - ./config/local.toml:/config/txwatch.toml:ro
+      - txwatch-data:/data
     environment:
       RUST_LOG: info
       TXWATCH_CONFIG: /config/txwatch.toml
     command: watch
     depends_on:
-      - stellar
-      - webhook
+      stellar:
+        condition: service_healthy
+      webhook:
+        condition: service_started
     networks:
       - txwatch
 
   webhook:
-    image: mendhak/http-https-echo:latest
+    image: mendhak/http-https-echo:latest@sha256:0000000000000000000000000000000000000000000000000000000000000000
     container_name: webhook-echo-local
     ports:
       - "8080:8080"
@@ -42,6 +55,9 @@ services:
       HTTP_PORT: "8080"
     networks:
       - txwatch
+
+volumes:
+  txwatch-data:
 
 networks:
   txwatch:
