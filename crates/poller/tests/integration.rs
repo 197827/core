@@ -1717,6 +1717,34 @@ async fn transactions_request_includes_failed() {
     );
 }
 
+/// Issue #271: a Horizon 429 must not be reported as a successful empty poll.
+/// The cycle must count as a poll failure (so readiness/freshness do not
+/// advance and the failure streak is not reset) and the rate-limited metric
+/// must be incremented.
+#[tokio::test]
+async fn horizon_429_is_not_a_successful_poll() {
+    let horizon = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "0")
+                .set_body_json(serde_json::json!({
+                    "status": 429,
+                    "title": "Too Many Requests",
+                })),
+        )
+        .mount(&horizon)
+        .await;
+
+    let mut contract =
+        helpers::contract("https://example.com/hook", vec![AlertRule::AnyTransaction]);
+    contract.horizon_base_url_override = Some(horizon.uri());
+    let cfg = AppConfig {
+        poll_interval_seconds: 3600,
+        contracts: vec![contract],
+        cursor_file: None,
 /// Issue #278: cursor persistence must not block the poll loop. With many
 /// contracts and a deliberately slow writer, every contract must still be
 /// polled promptly; the writes are coalesced and performed off the async
@@ -1767,6 +1795,54 @@ async fn slow_cursor_writer_does_not_delay_polls() {
         max_pages_per_cycle: None,
     };
 
+    let before = txwatch_poller::horizon_rate_limited_total();
+    let report = txwatch_poller::run_once(cfg, true)
+        .await
+        .expect("a rate-limited contract must not abort the whole cycle");
+
+    assert_eq!(report.transactions, 0);
+    assert_eq!(report.alerts, 0);
+    assert_eq!(
+        report.poll_failures, 1,
+        "a 429 must be counted as a poll failure, not a successful empty poll"
+    );
+    assert!(
+        !report.is_success(),
+        "a 429 must not report the cycle as successful"
+    );
+    assert!(
+        txwatch_poller::horizon_rate_limited_total() > before,
+        "txwatch_horizon_rate_limited_total must be incremented on a 429"
+    );
+}
+
+/// Issue #272: a long `Retry-After` back-off must not block shutdown. The
+/// poller is signalled to stop immediately after the 429 is received and must
+/// exit well before the 300 s back-off would elapse.
+#[tokio::test]
+async fn long_retry_after_does_not_block_shutdown() {
+    let horizon = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "300")
+                .set_body_json(serde_json::json!({
+                    "status": 429,
+                    "title": "Too Many Requests",
+                })),
+        )
+        .mount(&horizon)
+        .await;
+
+    let mut contract =
+        helpers::contract("https://example.com/hook", vec![AlertRule::AnyTransaction]);
+    contract.horizon_base_url_override = Some(horizon.uri());
+    let cfg = AppConfig {
+        poll_interval_seconds: 3600,
+        contracts: vec![contract],
+        cursor_file: None,
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let run = tokio::spawn(async move {
         txwatch_poller::run_with_shutdown(cfg, true, shutdown_rx).await
@@ -1833,6 +1909,32 @@ async fn state_file_persists_cooldown_and_no_activity_across_restart() {
         max_pages_per_cycle: None,
     };
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(txwatch_poller::run_with_shutdown(cfg, true, shutdown_rx));
+
+    // Wait until Horizon has actually served the 429, so the poller is inside
+    // (or about to enter) the back-off.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while horizon.received_requests().await.unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "Horizon never received the rate-limited request"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let stop_at = Instant::now();
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("poller must exit promptly instead of waiting out the back-off")
+        .unwrap()
+        .unwrap();
+    assert!(
+        stop_at.elapsed() < Duration::from_secs(5),
+        "shutdown took {:?}, the 300s Retry-After back-off blocked it",
+        stop_at.elapsed()
+    );
     // First run: no state yet, so nothing is suppressed.
     let report = txwatch_poller::run_once(cfg.clone(), true).await.unwrap();
     assert_eq!(report.poll_failures, 0);
