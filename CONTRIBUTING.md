@@ -43,8 +43,15 @@ curl -X POST http://localhost:8080/webhook -H "Content-Type: application/json" -
 
 To watch a different contract or change alert rules:
 
-1. Edit `config/example.toml`
+1. Edit `config/docker-compose.toml` (this is the file mounted by `docker-compose.yml`)
 2. Restart the stack: `docker compose down && docker compose up`
+
+Alternatively, send a `SIGHUP` to the running container to reload the config
+without restarting the stack:
+
+```bash
+docker compose kill -s HUP txwatch
+```
 
 ### Stopping the stack
 

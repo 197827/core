@@ -25,3 +25,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    # Watches the pinned image tags/digests in docker-compose.yml and
+    # docker-compose.local.yml (stellar/quickstart and mendhak/http-https-echo).
