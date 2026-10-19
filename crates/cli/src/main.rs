@@ -82,6 +82,10 @@ enum Command {
         /// Run a single poll cycle, deliver alerts, save cursors and exit
         #[arg(long)]
         once: bool,
+
+        /// Maximum number of contracts polled concurrently
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -192,6 +196,16 @@ enum Command {
         /// Also deliver the resulting webhooks to the contract's webhook_url
         #[arg(long)]
         send: bool,
+    },
+
+    /// Remove saved cursor entries for contracts that are no longer configured
+    ///
+    /// Reloads keep cursors of removed contracts so re-adding one resumes where
+    /// it left off; use this command to intentionally discard them.
+    PruneCursors {
+        /// Only report what would be removed, without writing the cursor file
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -381,6 +395,7 @@ async fn main() -> Result<()> {
                     format,
                     headers: parse_headers(&headers)?,
                     routing_key,
+                    ..Default::default()
                 };
                 destination.validate()?;
                 (vec![destination], selected)
@@ -520,6 +535,26 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::PruneCursors { dry_run } => {
+            let cfg = load_config(&cli)?;
+            let removed = prune_cursors(&cfg.cursor_file, &cfg, dry_run)?;
+            if removed.is_empty() {
+                println!("No stale cursor entries found in '{}'.", cfg.cursor_file);
+            } else {
+                let verb = if dry_run { "Would remove" } else { "Removed" };
+                println!(
+                    "{} {} stale cursor entr{} from '{}':",
+                    verb,
+                    removed.len(),
+                    if removed.len() == 1 { "y" } else { "ies" },
+                    cfg.cursor_file
+                );
+                for key in &removed {
+                    println!("  - {}", key);
+                }
+            }
+        }
+
         Command::Schema => println!(
             "{}",
             serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?
@@ -528,20 +563,23 @@ async fn main() -> Result<()> {
         Command::Watch {
             dry_run,
             once,
+            concurrency,
             #[cfg(feature = "metrics")]
             metrics_addr,
         } => {
             let config_path = required_config(&cli.config)?;
             let cfg = load_config(&cli)?;
+            let concurrency = concurrency.max(1);
 
             if once {
                 info!(
                     version = VERSION,
                     contracts = cfg.contracts.len(),
                     dry_run,
+                    concurrency,
                     "running a single TxWatch poll cycle"
                 );
-                let report = txwatch_poller::run_once(cfg, dry_run).await?;
+                let report = txwatch_poller::run_once(cfg, dry_run, concurrency).await?;
                 info!(
                     transactions = report.transactions,
                     alerts = report.alerts,
@@ -583,9 +621,11 @@ async fn main() -> Result<()> {
                 contracts = cfg.contracts.len(),
                 interval_secs = cfg.poll_interval_seconds,
                 dry_run = dry_run,
+                concurrency,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_reload(cfg, dry_run, shutdown_rx, reload_rx).await?;
+            txwatch_poller::run_with_reload(cfg, dry_run, concurrency, shutdown_rx, reload_rx)
+                .await?;
         }
     }
 
@@ -692,6 +732,51 @@ fn reload_config(path: &Path) -> Option<AppConfig> {
     }
 }
 
+/// Remove cursor entries whose `<network>:<contract_id>` key matches no
+/// configured contract. Returns the removed keys. When `dry_run` is set the
+/// file is left untouched.
+fn prune_cursors(path: &str, cfg: &AppConfig, dry_run: bool) -> Result<Vec<String>> {
+    let path = Path::new(path);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read cursor file '{}'", path.display()))?;
+    let mut cursors: std::collections::BTreeMap<String, String> = if raw.trim().is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse cursor file '{}'", path.display()))?
+    };
+
+    let configured: std::collections::HashSet<String> = cfg
+        .contracts
+        .iter()
+        .map(|c| format!("{}:{}", c.network.as_str(), c.contract_id))
+        .collect();
+
+    let stale: Vec<String> = cursors
+        .keys()
+        .filter(|key| !configured.contains(*key))
+        .cloned()
+        .collect();
+
+    if !dry_run && !stale.is_empty() {
+        for key in &stale {
+            cursors.remove(key);
+        }
+        let serialized = serde_json::to_string_pretty(&cursors)?;
+        // Write to a sibling temp file and rename so a crash can't truncate it.
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, serialized)
+            .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("failed to replace '{}'", path.display()))?;
+    }
+
+    Ok(stale)
+}
+
 /// Load the config and apply `--horizon-url`, if given, to every contract.
 fn load_config(cli: &Cli) -> Result<AppConfig> {
     let mut cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
@@ -769,6 +854,15 @@ fn describe_destination(destination: &WebhookDestination) -> String {
     if destination.routing_key.is_some() {
         parts.push(format!("routing_key: {}", REDACTED));
     }
+    if destination.client_cert.is_some() {
+        parts.push("mtls: set".to_string());
+    }
+    if let Some(min) = &destination.min_severity {
+        parts.push(format!("min_severity: {}", min));
+    }
+    if !destination.rule_types.is_empty() {
+        parts.push(format!("rule_types: {}", destination.rule_types.join(", ")));
+    }
     format!("{} ({})", destination.url, parts.join(", "))
 }
 
@@ -785,13 +879,16 @@ fn destination_summary_json(destination: &WebhookDestination) -> serde_json::Val
         "secret_set": destination.secret.is_some(),
         "headers": headers,
         "routing_key_set": destination.routing_key.is_some(),
+        "mtls_set": destination.client_cert.is_some(),
+        "min_severity": destination.min_severity,
+        "rule_types": destination.rule_types,
     })
 }
 
 fn parse_webhook_format(value: &str) -> Result<WebhookFormat, String> {
     serde_json::from_value(serde_json::Value::from(value)).map_err(|_| {
         format!(
-            "unknown format '{}': use txwatch, slack, discord or pagerduty",
+            "unknown format '{}': use txwatch, slack, discord, pagerduty or template",
             value
         )
     })
