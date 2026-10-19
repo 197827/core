@@ -341,6 +341,101 @@ webhook_secret = "super-secret-value"
 }
 
 #[test]
+fn validate_json_snapshot_with_cooldowns_and_horizon_override() {
+    const COOLDOWN_CONFIG: &str = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Cooldown Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+
+  [[contracts.rules]]
+  type            = "LargeTransfer"
+  threshold_xlm   = 100
+  cooldown_seconds = 60
+"#;
+
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_validate_json_cooldown_test.toml");
+    fs::write(&path, COOLDOWN_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "--horizon-url",
+            "https://custom-horizon.example.com",
+            "validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "expected exit code 0 for valid config"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = r#"{
+  "contracts": [
+    {
+      "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+      "enabled": true,
+      "explorer_url": "https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+      "horizon_url": "https://custom-horizon.example.com",
+      "label": "Cooldown Contract",
+      "network": "testnet",
+      "poll_interval_seconds": 10,
+      "rules": [
+        {
+          "type": "AnyTransaction"
+        },
+        {
+          "cooldown_seconds": 60,
+          "threshold_xlm": 100.0,
+          "type": "LargeTransfer"
+        }
+      ],
+      "webhook_secret_set": false,
+      "webhook_url": "https://hooks.example.com/test",
+      "webhooks": [
+        {
+          "format": "txwatch",
+          "headers": {},
+          "routing_key_set": false,
+          "secret_set": false,
+          "url": "https://hooks.example.com/test"
+        }
+      ]
+    }
+  ],
+  "cursor_file": null,
+  "poll_interval_seconds": 10,
+  "valid": true
+}
+"#;
+    assert_eq!(stdout, expected);
+
+    // The JSON object must not contain duplicate keys; serde_json's map keeps
+    // only the last value, so verify the effective override is reported.
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["contracts"][0]["horizon_url"],
+        "https://custom-horizon.example.com"
+    );
+    let rules = json["contracts"][0]["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[1]["cooldown_seconds"], 60);
+}
+
+#[test]
 fn validate_json_reports_errors() {
     let dir = env::temp_dir();
     let path = dir.join("txwatch_validate_json_invalid_test.toml");
